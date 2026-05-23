@@ -1,0 +1,58 @@
+--- a/src/wayland/meta-wayland-keyboard.c	2026-03-15 20:31:04.000000000 +0000
++++ b/src/wayland/meta-wayland-keyboard.c	2026-05-23 16:35:06.176065474 +0100
+@@ -56,6 +56,39 @@
+ #include "mtk/mtk.h"
+ #include "wayland/meta-wayland-private.h"
+ 
++#include <gio/gio.h>
++
++/* kierandrewett/mutter jailbreak: every Wayland key event emits a
++ * session-bus D-Bus signal so user-space tools can observe global key
++ * input without needing /dev/input access. See screen-mirror's
++ * keyboard overlay. */
++static GDBusConnection *_kdr_session_bus = NULL;
++static gboolean _kdr_session_bus_tried = FALSE;
++
++static void
++_kdr_emit_key_event (uint32_t keysym,
++                     uint32_t state,
++                     uint32_t unicode,
++                     gboolean is_press)
++{
++  if (!_kdr_session_bus && !_kdr_session_bus_tried)
++    {
++      _kdr_session_bus_tried = TRUE;
++      _kdr_session_bus = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, NULL);
++    }
++  if (!_kdr_session_bus)
++    return;
++  g_dbus_connection_emit_signal (_kdr_session_bus,
++                                 NULL,
++                                 "/dev/kieran/mutter/keys",
++                                 "dev.kieran.mutter.Keys",
++                                 "Event",
++                                 g_variant_new ("(uuub)",
++                                                keysym, state, unicode,
++                                                is_press),
++                                 NULL);
++}
++
+ typedef struct
+ {
+   struct xkb_keymap *keymap;
+@@ -623,6 +656,15 @@
+       !(flags & CLUTTER_EVENT_FLAG_INPUT_METHOD))
+     return FALSE;
+ 
++  /* kierandrewett/mutter jailbreak: broadcast the key on session bus. */
++  {
++    ClutterEvent *cev = (ClutterEvent *) event;
++    _kdr_emit_key_event (clutter_event_get_key_symbol (cev),
++                         clutter_event_get_state (cev),
++                         clutter_event_get_key_unicode (cev),
++                         clutter_event_type (cev) == CLUTTER_KEY_PRESS);
++  }
++
+   meta_topic (META_DEBUG_WAYLAND,
+               "Handling key %s event code %d",
+               is_press ? "press" : "release",

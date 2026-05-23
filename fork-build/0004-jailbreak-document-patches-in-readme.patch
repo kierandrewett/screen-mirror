@@ -1,0 +1,95 @@
+--- a/README.md	2026-04-14 16:00:45.000000000 +0100
++++ b/README.md	2026-05-23 15:12:20.816754440 +0100
+@@ -1,12 +1,85 @@
+-# GNOME Shell
++# GNOME Shell — kierandrewett fork
+ 
+-GNOME Shell provides core user interface functions for the GNOME desktop,
+-like switching to windows and launching applications. GNOME Shell takes
+-advantage of the capabilities of modern graphics hardware and introduces
+-innovative user interface concepts to provide a visually attractive and
+-easy-to-use experience.
++This is a personal fork of [GNOME Shell](https://gitlab.gnome.org/GNOME/gnome-shell)
++that removes a handful of security/permission gates so the shell can be
++driven and extended more freely from local code. **Don't run this on a
++machine you don't fully trust.** Each gate is in place upstream for a
++reason; this fork accepts the trade-off in exchange for unattended
++automation.
+ 
+-All interactions with the project should follow the [Code of Conduct][conduct].
++Base: upstream tag `49.6`.
++
++## Patches in this fork
++
++### 1. `unsafe-mode` enabled at shell startup
++*File:* `js/ui/main.js`
++
++`global.context.unsafe_mode = true;` is set at the top of `start()`,
++before `_initializeUI()` connects the `notify::unsafe-mode` handler — so
++no "System was put in unsafe mode" notification fires. Effect:
++
++- `org.gnome.Shell.Eval(script)` is callable from any session-bus client,
++  not just Looking Glass. Things like `global.get_pointer()`,
++  `global.display.focus_window`, etc. are readable from a regular script.
++- Any other shell code that gates on `global.context.unsafe_mode` runs in
++  permissive mode.
++
++Upstream guard reference: `if (!global.context.unsafe_mode)` in
++`js/ui/shellDBus.js`, `js/misc/util.js`.
++
++### 2. Extension version validation disabled
++*File:* `js/ui/extensionSystem.js`
++
++`ExtensionManager._isOutOfDate()` now hard-returns `false`. Effect:
++
++- Any extension loads regardless of the `shell-version` field in its
++  `metadata.json`. Equivalent to setting
++  `org.gnome.shell.disable-extension-version-validation = true`
++  permanently, but baked in (so it can't be turned back on by config).
++- Note this only bypasses the in-shell *version* check. The extension
++  still has to be enabled (`gnome-extensions enable <uuid>`) and live in
++  one of the standard search paths.
++
++### 3. Access portal auto-grants every request
++*File:* `js/ui/accessDialog.js`
++
++`AccessDialogDBus.AccessDialogAsync` no longer constructs a modal
++dialog; it returns `(0, {})` immediately (response = OK, no choice
++results). The `DBusSenderChecker` is kept so only the legitimate
++xdg-desktop-portal-gnome frontend and the GNOME RemoteDesktop handover
++can drive it — random session apps still can't call this directly.
++
++This implements `org.freedesktop.impl.portal.Access`, the generic portal
++backend used for "Allow / Deny" prompts. Effect:
++
++- Any portal Access request surfaced through gnome-shell auto-grants.
++- **Note: this does not cover the xdg-desktop-portal ScreenCast source
++  picker.** That dialog lives in `xdg-desktop-portal-gnome` (separate
++  repo). Direct `org.gnome.Mutter.ScreenCast` clients are already
++  unattended (no UI, no portal involvement) — see the `screen-mirror`
++  consumer for an example.
++
++### 4. Version string branded `49.6+kdr`
++*File:* `meson.build`
++
++`project()` version is bumped from `49.6` to `49.6+kdr`. This makes the
++fork visibly identifiable everywhere PACKAGE_VERSION shows up:
++
++- `gnome-shell --version` → `GNOME Shell 49.6+kdr`
++- `org.gnome.Shell.ShellVersion` D-Bus property → `49.6+kdr`
++- Settings → About → GNOME Version → `49.6+kdr`
++
++`PACKAGE_VERSION.split('.')[0]` still returns `"49"`, so any code that
++extracts the major version (e.g. extension downloader URLs) keeps
++working. Extension version validation is bypassed anyway (patch 2), so
++the `+kdr` suffix doesn't disqualify any extensions.
++
++## Building / installing
++
++The accompanying RPM build (`fork-build/` in the consumer repo) applies
++these as patches on the Fedora `gnome-shell` SRPM and produces an
++installable `.rpm`. Recovery if a build breaks the session: drop to a
++TTY (`Ctrl+Alt+F3`), `sudo dnf downgrade gnome-shell`, log back in.
+ 
+ [conduct]: https://conduct.gnome.org/
+ 

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Verifies the kierandrewett/gnome-shell jailbreak patches are active.
+# Run AFTER logging out and back in following the gnome-shell install.
+
+set -u
+
+pass() { printf '  \e[32m✓\e[0m %s\n' "$1"; }
+fail() { printf '  \e[31m✗\e[0m %s\n' "$1"; failures=$((failures+1)); }
+section() { printf '\n\e[1m%s\e[0m\n' "$1"; }
+
+failures=0
+LIB=/usr/lib64/gnome-shell/libshell-17.so
+
+section "Installed package"
+ver=$(gnome-shell --version 2>&1)
+pkg=$(rpm -q gnome-shell 2>&1)
+echo "  $ver"
+echo "  $pkg"
+if [[ "$pkg" == *kdr* ]]; then
+    pass "running the kdr-tagged build"
+else
+    fail "installed gnome-shell is NOT the kdr build — log out/in if you just installed"
+fi
+
+section "Patch 1: unsafe-mode enabled at startup"
+mode=$(gdbus call --session --dest org.gnome.Shell \
+  --object-path /org/gnome/Shell --method org.gnome.Shell.Eval \
+  "global.context.unsafe_mode" 2>&1)
+case "$mode" in
+    *"(true, 'true')"*) pass "global.context.unsafe_mode === true (runtime)" ;;
+    *"(true, 'false')"*) fail "Eval works but unsafe_mode is false — patch not loaded" ;;
+    *"(false, ''"*) fail "Shell.Eval rejected — unsafe-mode is off (patch not loaded)" ;;
+    *) fail "Unexpected Eval response: $mode" ;;
+esac
+
+ptr=$(gdbus call --session --dest org.gnome.Shell \
+  --object-path /org/gnome/Shell --method org.gnome.Shell.Eval \
+  "JSON.stringify(global.get_pointer())" 2>&1)
+if [[ "$ptr" == "(true,"*'"['*']"'* ]]; then
+    pass "global.get_pointer() returns coords: ${ptr#*\'}"
+else
+    fail "get_pointer() unexpected: $ptr"
+fi
+
+if strings "$LIB" 2>/dev/null | grep -qF "jailbreak: enable unsafe-mode"; then
+    pass "patch marker present in $LIB"
+else
+    fail "patch 1 marker missing from $LIB"
+fi
+
+section "Patch 2: extension version validation disabled"
+if strings "$LIB" 2>/dev/null | grep -qF "jailbreak: always treat extensions as"; then
+    pass "patch marker present in $LIB"
+else
+    fail "patch 2 marker missing from $LIB"
+fi
+
+section "Patch 3: AccessDialog auto-grants"
+if strings "$LIB" 2>/dev/null | grep -qF "jailbreak: auto-grant every access"; then
+    pass "patch marker present in $LIB"
+else
+    fail "patch 3 marker missing from $LIB"
+fi
+
+section "Bonus: Mutter ScreenCast is unattended (always was)"
+if gdbus introspect --session --dest org.gnome.Mutter.ScreenCast \
+     --object-path /org/gnome/Mutter/ScreenCast 2>/dev/null | grep -q "CreateSession"; then
+    pass "org.gnome.Mutter.ScreenCast.CreateSession available without prompt"
+else
+    fail "Mutter ScreenCast not introspectable"
+fi
+
+echo
+if [[ "$failures" -eq 0 ]]; then
+    printf '\e[32m===\e[0m All jailbreak patches active.\n'
+    exit 0
+else
+    printf '\e[31m===\e[0m %d check(s) failed.\n' "$failures"
+    exit 1
+fi

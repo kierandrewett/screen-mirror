@@ -1,0 +1,18 @@
+--- a/js/ui/extensionSystem.js	2026-04-14 16:00:45.000000000 +0100
++++ b/js/ui/extensionSystem.js	2026-05-23 14:57:02.117861989 +0100
+@@ -406,9 +406,12 @@
+         return extension.metadata.version === version;
+     }
+ 
+-    _isOutOfDate(extension) {
+-        const [major] = Config.PACKAGE_VERSION.split('.');
+-        return !extension.metadata['shell-version'].some(v => v.startsWith(major));
++    _isOutOfDate(_extension) {
++        // kierandrewett/gnome-shell jailbreak: always treat extensions as
++        // in-date so any extension loads regardless of its shell-version
++        // metadata. Equivalent to permanently setting the
++        // disable-extension-version-validation gsetting.
++        return false;
+     }
+ 
+     async loadExtension(extension) {

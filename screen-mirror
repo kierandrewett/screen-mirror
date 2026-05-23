@@ -1,0 +1,1904 @@
+#!/usr/bin/env python3
+"""Mirror the monitor the mouse is on to a projector (HDMI-1 by default).
+
+Software mirror: captures monitor pixels via PipeWire (Mutter ScreenCast API)
+and displays them in a fullscreen GTK4 window on the projector. The source
+monitor's native resolution is never changed; the captured frame is scaled
+to fit the projector. Cursor position is polled via Xlib (Xwayland).
+"""
+
+import argparse
+import json
+import math
+import signal
+import sys
+from typing import Optional
+
+import gi
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gst", "1.0")
+gi.require_version("Graphene", "1.0")
+gi.require_version("Gsk", "4.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import GLib, GObject, Gio, Gtk, Gdk, Gst, Graphene, Gsk  # noqa: E402
+from gi.repository import Pango, PangoCairo  # noqa: E402
+
+
+class PanningPaintable(GObject.GObject, Gdk.Paintable):
+    """Wraps the sink's paintable. From the outside it reports the
+    projector's exact view size as the intrinsic — so a Gtk.Picture is
+    pinned to that size and nothing overflows. Internally it renders
+    the source at `render_w x render_h` (the "display" size, possibly
+    larger than the view) translated by (dx, dy). Pan updates just
+    move dx/dy and invalidate contents — no widget relayout, no
+    pipeline renegotiation.
+    """
+    def __init__(self, src: Gdk.Paintable,
+                 render_w: int, render_h: int,
+                 view_w: int, view_h: int,
+                 lens_radius: float = 90.0,
+                 lens_zoom: float = 1.5,
+                 ring_color: tuple = (0.0, 1.0, 0.66, 1.0)):
+        super().__init__()
+        self._src = src
+        self._rw = max(1, int(render_w))
+        self._rh = max(1, int(render_h))
+        self._vw = max(1, int(view_w))
+        self._vh = max(1, int(view_h))
+        self._dx = 0.0
+        self._dy = 0.0
+        # Cursor's position within the view (projector logical pixels);
+        # drives the magnifier lens (None = no lens).
+        self._cursor_view: Optional[tuple] = None
+        # Separate "anchor" position for placing the keyboard overlay
+        # near the cursor. Kept set even when the lens is hidden so the
+        # overlay stays attached to where the user actually is.
+        self._anchor_view: Optional[tuple] = None
+        self._lens_radius = float(lens_radius)
+        self._lens_zoom = max(1.0, float(lens_zoom))
+        self._ring_color = ring_color
+        # Keyboard overlay text. Either a plain string (legacy code
+        # path) or a list of (text, alpha) chunks (preferred, fades
+        # individual keys independently). The painter uses items if
+        # present, else falls back to text.
+        self._key_text = ""
+        self._key_items: list = []
+        # Source-switch banner: big text shown briefly at top-center
+        # when the cursor moves to a new monitor.
+        self._banner_text = ""
+        self._banner_alpha = 0.0
+        # Focus-info top-left chip (app icon + name + title).
+        self._focus_icon: Optional[Gdk.Paintable] = None
+        self._focus_app = ""
+        self._focus_title = ""
+        # Top-right clock chip (text only).
+        self._clock_text = ""
+        # Fullscreen mode flag — paints a backdrop and suppresses
+        # every chrome overlay (focus chip, clock, key overlay, banner).
+        self._fs_mode = False
+        self._fs_bg = (0.0, 0.0, 0.0)  # RGB tuple, 0–1
+        # Caps Lock indicator — rendered as its own chip at the left
+        # of the key overlay row whenever Caps is on.
+        self._caps_on = False
+        self._inv_id = src.connect(
+            "invalidate-contents", lambda *_: self.invalidate_contents(),
+        )
+
+    def detach(self):
+        if self._inv_id:
+            try:
+                self._src.disconnect(self._inv_id)
+            except Exception:
+                pass
+            self._inv_id = 0
+
+    def set_offset(self, dx: float, dy: float):
+        if dx == self._dx and dy == self._dy:
+            return
+        self._dx = dx
+        self._dy = dy
+        self.invalidate_contents()
+
+    def set_render_size(self, rw: int, rh: int):
+        rw = max(1, int(rw))
+        rh = max(1, int(rh))
+        if rw == self._rw and rh == self._rh:
+            return
+        self._rw = rw
+        self._rh = rh
+        self.invalidate_contents()
+
+    def set_cursor_view(self, x: Optional[float], y: Optional[float]):
+        if x is None or y is None:
+            new = None
+        else:
+            new = (float(x), float(y))
+        if new == self._cursor_view:
+            return
+        self._cursor_view = new
+        self.invalidate_contents()
+
+    def set_anchor_view(self, x: Optional[float], y: Optional[float]):
+        if x is None or y is None:
+            new = None
+        else:
+            new = (float(x), float(y))
+        if new == self._anchor_view:
+            return
+        self._anchor_view = new
+        self.invalidate_contents()
+
+    def set_key_text(self, text: str):
+        if text == getattr(self, "_key_text", ""):
+            return
+        self._key_text = text or ""
+        self.invalidate_contents()
+
+    def set_key_items(self, items: list):
+        # items: list of (text:str, alpha:float). Replaces previous list.
+        self._key_items = list(items)
+        self.invalidate_contents()
+
+    def set_banner(self, text: str, alpha: float):
+        if text == self._banner_text and alpha == self._banner_alpha:
+            return
+        self._banner_text = text or ""
+        self._banner_alpha = max(0.0, min(1.0, float(alpha)))
+        self.invalidate_contents()
+
+    def set_focus_info(self, icon: Optional[Gdk.Paintable], app: str, title: str):
+        app = app or ""
+        title = title or ""
+        if icon is self._focus_icon and app == self._focus_app and title == self._focus_title:
+            return
+        self._focus_icon = icon
+        self._focus_app = app
+        self._focus_title = title
+        self.invalidate_contents()
+
+    def set_clock_text(self, text: str):
+        text = text or ""
+        if text == self._clock_text:
+            return
+        self._clock_text = text
+        self.invalidate_contents()
+
+    def set_fs_mode(self, on: bool):
+        on = bool(on)
+        if on == self._fs_mode:
+            return
+        self._fs_mode = on
+        self.invalidate_contents()
+
+    def set_lens_zoom(self, zoom: float):
+        z = max(1.0, float(zoom))
+        if z == self._lens_zoom:
+            return
+        self._lens_zoom = z
+        self.invalidate_contents()
+
+    def set_fs_bg(self, r: float, g: float, b: float):
+        c = (float(r), float(g), float(b))
+        if c == self._fs_bg:
+            return
+        self._fs_bg = c
+        self.invalidate_contents()
+
+    def set_caps_on(self, on: bool):
+        on = bool(on)
+        if on == self._caps_on:
+            return
+        self._caps_on = on
+        self.invalidate_contents()
+
+    def do_get_intrinsic_width(self):
+        return self._vw
+
+    def do_get_intrinsic_height(self):
+        return self._vh
+
+    def do_get_intrinsic_aspect_ratio(self):
+        return self._vw / self._vh if self._vh else 0.0
+
+    def do_snapshot(self, snapshot, width, height):
+        # Map our view coords to the requested draw size.
+        sx = width / self._vw
+        sy = height / self._vh
+
+        if self._fs_mode:
+            # Backdrop so letterbox/pillarbox bars don't appear as the
+            # window's default white.
+            bg = snapshot.append_cairo(Graphene.Rect().init(0, 0, width, height))
+            bg.set_source_rgb(*self._fs_bg)
+            bg.rectangle(0, 0, width, height)
+            bg.fill()
+
+        # Source render (translated by the pan offset).
+        snapshot.save()
+        snapshot.translate(Graphene.Point().init(self._dx * sx, self._dy * sy))
+        self._src.snapshot(snapshot, self._rw * sx, self._rh * sy)
+        snapshot.restore()
+
+        # Lens stays in both modes — auto-hide is driven by Mirror's
+        # idle timer regardless of fs.
+        if self._cursor_view is not None:
+            self._draw_lens(snapshot, sx, sy)
+
+        if self._fs_mode:
+            # Skip the rest of the chrome in fullscreen — projector
+            # stays a clean mirror except for the magnifier.
+            return
+
+        self._draw_focus_chip(snapshot, sx, sy)
+        self._draw_clock_chip(snapshot, sx, sy)
+        self._draw_key_overlay(snapshot, sx, sy)
+        self._draw_banner(snapshot, sx, sy)
+
+    def _draw_clock_chip(self, snapshot, sx, sy):
+        if not self._clock_text:
+            return
+        font_pt = 12.0
+        pad_x = 8.0
+        pad_y = 4.0
+        margin = 12.0
+        scratch = snapshot.append_cairo(Graphene.Rect().init(0, 0, 1, 1))
+        layout = PangoCairo.create_layout(scratch)
+        desc = Pango.FontDescription.from_string(f"Sans Bold {font_pt}")
+        layout.set_font_description(desc)
+        layout.set_text(self._clock_text, -1)
+        _ink, log = layout.get_pixel_extents()
+        text_w = log.width / sx
+        text_h = log.height / sy
+        plate_w = text_w + 2 * pad_x
+        plate_h = text_h + 2 * pad_y
+        x = self._vw - margin - plate_w
+        y = margin
+        bounds = Graphene.Rect().init(
+            x * sx, y * sy, (plate_w + 4) * sx, (plate_h + 2) * sy,
+        )
+        cr = snapshot.append_cairo(bounds)
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.92)
+        cr.rectangle(x * sx, y * sy, plate_w * sx, plate_h * sy)
+        cr.fill()
+        cr.set_source_rgba(0.0, 0.0, 0.0, 1.0)
+        cr.move_to((x + pad_x) * sx, (y + pad_y) * sy)
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(desc)
+        layout.set_text(self._clock_text, -1)
+        PangoCairo.show_layout(cr, layout)
+
+    def _draw_focus_chip(self, snapshot, sx, sy):
+        if not self._focus_app and not self._focus_title and self._focus_icon is None:
+            return
+        icon_size = 26.0
+        font_pt = 12.0       # Pango "pt" — fontconfig scales by display
+        pad_x = 6.0
+        pad_y = 4.0
+        gap = 6.0
+        margin = 12.0
+        app_text = self._focus_app
+        title_text = self._focus_title
+        if len(title_text) > 100:
+            title_text = title_text[:99] + "…"
+        if len(app_text) > 40:
+            app_text = app_text[:39] + "…"
+        sep = "  ·  "
+        if app_text and title_text:
+            combined = app_text + sep + title_text
+        elif app_text:
+            combined = app_text
+        else:
+            combined = title_text
+
+        # Use Pango so emoji and other non-latin glyphs in titles fall
+        # back through fontconfig instead of disappearing.
+        scratch = snapshot.append_cairo(Graphene.Rect().init(0, 0, 1, 1))
+        layout = PangoCairo.create_layout(scratch)
+        desc = Pango.FontDescription.from_string(f"Sans Bold {font_pt}")
+        layout.set_font_description(desc)
+        layout.set_text(combined, -1)
+        _ink, log_rect = layout.get_pixel_extents()
+        text_w_px = log_rect.width
+        text_h_px = log_rect.height
+        text_w_logical = text_w_px / sx
+        text_h_logical = text_h_px / sy
+        # Trim from the right if it overflows the projector width.
+        max_text_logical = self._vw - 2 * margin - 2 * pad_x - (
+            icon_size + gap if self._focus_icon is not None else 0
+        )
+        if text_w_logical > max_text_logical and title_text:
+            # Binary-search the longest title that fits.
+            lo, hi = 0, len(title_text)
+            best = title_text
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                candidate = title_text[:mid] + ("…" if mid < len(title_text) else "")
+                test_combined = (app_text + sep + candidate) if app_text else candidate
+                layout.set_text(test_combined, -1)
+                _ink, lr = layout.get_pixel_extents()
+                if lr.width / sx <= max_text_logical:
+                    best = candidate
+                    lo = mid
+                else:
+                    hi = mid - 1
+            combined = (app_text + sep + best) if app_text else best
+            layout.set_text(combined, -1)
+            _ink, log_rect = layout.get_pixel_extents()
+            text_w_px = log_rect.width
+            text_h_px = log_rect.height
+            text_w_logical = text_w_px / sx
+            text_h_logical = text_h_px / sy
+
+        has_icon = self._focus_icon is not None
+        plate_w = (icon_size + gap if has_icon else 0) + text_w_logical + 2 * pad_x
+        plate_h = max(icon_size if has_icon else 0, text_h_logical) + 2 * pad_y
+        x = margin
+        y = margin
+        bounds = Graphene.Rect().init(
+            x * sx, y * sy, (plate_w + 4) * sx, (plate_h + 2) * sy,
+        )
+        cr = snapshot.append_cairo(bounds)
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.92)
+        cr.rectangle(x * sx, y * sy, plate_w * sx, plate_h * sy)
+        cr.fill()
+        text_origin_x = x + pad_x
+        if has_icon:
+            try:
+                snapshot.save()
+                snapshot.translate(Graphene.Point().init(
+                    (x + pad_x) * sx, (y + (plate_h - icon_size) / 2) * sy,
+                ))
+                self._focus_icon.snapshot(snapshot, icon_size * sx, icon_size * sy)
+                snapshot.restore()
+                text_origin_x = x + pad_x + icon_size + gap
+            except Exception:
+                pass
+        text_origin_y = y + (plate_h - text_h_logical) / 2
+        cr.set_source_rgba(0.0, 0.0, 0.0, 1.0)
+        cr.move_to(text_origin_x * sx, text_origin_y * sy)
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(desc)
+        layout.set_text(combined, -1)
+        PangoCairo.show_layout(cr, layout)
+
+    def _draw_lens(self, snapshot, sx, sy):
+        cx_view, cy_view = self._cursor_view
+
+        # Magnifier lens: re-render the source at a higher zoom, offset
+        # so the cursor's source-pixel lands at the cursor view
+        # position, clipped to a circle around the cursor.
+        cx_disp = cx_view - self._dx
+        cy_disp = cy_view - self._dy
+        lz = self._lens_zoom
+        lens_off_x = cx_view - cx_disp * lz
+        lens_off_y = cy_view - cy_disp * lz
+        rad = self._lens_radius
+        rect = Graphene.Rect().init(
+            (cx_view - rad) * sx, (cy_view - rad) * sy,
+            rad * 2 * sx, rad * 2 * sy,
+        )
+        # Build a Gsk.RoundedRect with all four corners = rad, making
+        # the rounded rect a circle when w == h.
+        rounded = Gsk.RoundedRect()
+        rounded.init_from_rect(rect, rad * max(sx, sy))
+        snapshot.push_rounded_clip(rounded)
+        snapshot.save()
+        snapshot.translate(Graphene.Point().init(lens_off_x * sx, lens_off_y * sy))
+        self._src.snapshot(snapshot, self._rw * lz * sx, self._rh * lz * sy)
+        snapshot.restore()
+        snapshot.pop()
+
+        # Neon ring around the lens edge so the magnified region is
+        # visually distinct from the rest of the panned view.
+        bounds = Graphene.Rect().init(
+            (cx_view - rad - 4) * sx, (cy_view - rad - 4) * sy,
+            (rad * 2 + 8) * sx, (rad * 2 + 8) * sy,
+        )
+        cr = snapshot.append_cairo(bounds)
+        r0, g0, b0, _a0 = self._ring_color
+        cx_pix = cx_view * sx
+        cy_pix = cy_view * sy
+        r_pix = rad * max(sx, sy)
+        for stroke_w, alpha in ((10.0, 0.20), (4.0, 0.95)):
+            cr.set_source_rgba(r0, g0, b0, alpha)
+            cr.set_line_width(stroke_w * max(sx, sy))
+            cr.arc(cx_pix, cy_pix, r_pix, 0.0, 2.0 * math.pi)
+            cr.stroke()
+
+    def _draw_key_overlay(self, snapshot, sx, sy):
+        items = list(self._key_items)
+        if not items and self._key_text:
+            # Legacy: single string, full alpha.
+            items = [(self._key_text, 1.0)]
+        if self._caps_on:
+            items.insert(0, ("⇧ CAPS", 1.0))
+        if not items:
+            return
+        font_size = 56.0
+        pad = 10.0
+        gap = 5.0  # spacing between key chunks
+        # Margin clears the magnifier lens when it's visible; drops to
+        # a tight gap once the lens has faded so the overlay moves
+        # closer to the cursor.
+        margin = 24.0
+        if self._cursor_view is not None:
+            margin = max(margin, self._lens_radius + 16.0)
+        max_w = self._vw - 2 * margin
+        # First pass: measure with full font_size on a throwaway scratch
+        # context, shrink uniformly if needed.
+        scratch_bounds = Graphene.Rect().init(0, 0, self._vw * sx, font_size * sy)
+        scratch = snapshot.append_cairo(scratch_bounds)
+        scratch.select_font_face("monospace", 0, 1)
+
+        def measure(size_pts: float) -> float:
+            scratch.set_font_size(size_pts * min(sx, sy))
+            total = 0.0
+            for i, (text, _a) in enumerate(items):
+                ext = scratch.text_extents(text)
+                total += ext.x_advance + 2 * pad * sx
+                if i < len(items) - 1:
+                    total += gap * sx
+            return total
+
+        current_w = measure(font_size)
+        max_w_px = max_w * sx
+        if current_w > max_w_px:
+            font_size *= max_w_px / current_w
+            font_size = max(12.0, font_size)
+            current_w = measure(font_size)
+        plate_h = font_size + 2 * pad
+        # Anchor near cursor (above by default; flips below if there's
+        # no room above). Falls back to top-left if no anchor known.
+        total_w_logical = current_w / sx
+        if self._anchor_view is not None:
+            ax, ay = self._anchor_view
+            x = ax - total_w_logical / 2
+            x = max(margin, min(self._vw - margin - total_w_logical, x))
+            y = ay - plate_h - margin
+            if y < margin:
+                # Not enough room above — drop it below the cursor.
+                y = ay + margin
+                y = min(y, self._vh - margin - plate_h)
+        else:
+            x = margin
+            y = margin
+        bounds = Graphene.Rect().init(
+            x * sx, y * sy, current_w + 2 * sx, plate_h * sy,
+        )
+        cr = snapshot.append_cairo(bounds)
+        cr.select_font_face("monospace", 0, 1)
+        cr.set_font_size(font_size * min(sx, sy))
+        cur_x = x
+        for text, alpha in items:
+            ext = cr.text_extents(text)
+            chunk_w = ext.x_advance + 2 * pad * sx
+            # White plate with black text.
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.92 * alpha)
+            cr.rectangle(cur_x * sx, y * sy, chunk_w, plate_h * sy)
+            cr.fill()
+            cr.set_source_rgba(0.0, 0.0, 0.0, alpha)
+            cr.move_to((cur_x * sx) + pad * sx,
+                       (y + pad) * sy + font_size * 0.78 * min(sx, sy))
+            cr.show_text(text)
+            cur_x += (chunk_w + gap * sx) / sx
+
+    def _draw_banner(self, snapshot, sx, sy):
+        if not self._banner_text or self._banner_alpha <= 0.0:
+            return
+        font_size = 36.0
+        pad = 12.0
+        plate_h = font_size + 2 * pad
+        y = 110.0  # below the key overlay (which starts at y=24 + ~60 high)
+        # Bounds must cover the full plate including its y offset, or
+        # Cairo clips it.
+        bounds = Graphene.Rect().init(
+            0, 0,
+            self._vw * sx,
+            (y + plate_h + 2) * sy,
+        )
+        cr = snapshot.append_cairo(bounds)
+        cr.select_font_face("sans-serif", 0, 1)  # bold
+        cr.set_font_size(font_size * min(sx, sy))
+        ext = cr.text_extents(self._banner_text)
+        plate_w = ext.x_advance + 2 * pad * sx
+        x = (self._vw * sx - plate_w) / 2
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95 * self._banner_alpha)
+        cr.rectangle(x, y * sy, plate_w, plate_h * sy)
+        cr.fill()
+        cr.set_source_rgba(0.0, 0.0, 0.0, self._banner_alpha)
+        cr.move_to(x + pad * sx,
+                   (y + pad) * sy + font_size * 0.78 * min(sx, sy))
+        cr.show_text(self._banner_text)
+
+    def do_get_flags(self):
+        return self._src.get_flags()
+
+
+SC_BUS = "org.gnome.Mutter.ScreenCast"
+SC_PATH = "/org/gnome/Mutter/ScreenCast"
+SC_IFACE = "org.gnome.Mutter.ScreenCast"
+SESSION_IFACE = "org.gnome.Mutter.ScreenCast.Session"
+STREAM_IFACE = "org.gnome.Mutter.ScreenCast.Stream"
+
+DC_BUS = "org.gnome.Mutter.DisplayConfig"
+DC_PATH = "/org/gnome/Mutter/DisplayConfig"
+DC_IFACE = "org.gnome.Mutter.DisplayConfig"
+
+SHELL_BUS = "org.gnome.Shell"
+SHELL_PATH = "/org/gnome/Shell"
+SHELL_IFACE = "org.gnome.Shell"
+
+# Key events emitted by the patched Mutter (kierandrewett/mutter fork).
+# See src/wayland/meta-wayland-keyboard.c — every key press/release goes
+# out as a session-bus signal with (uuub) keysym/state/unicode/is_press.
+MUTTER_KEY_PATH = "/dev/kieran/mutter/keys"
+MUTTER_KEY_IFACE = "dev.kieran.mutter.Keys"
+MUTTER_KEY_SIGNAL = "Event"
+
+# Custom D-Bus signal pushed from shell-side JS on every pointer motion.
+# The shell hook is installed once via Shell.Eval; from then on we get
+# cursor updates as signals instead of polling.
+HOOK_PATH = "/dev/kieran/screenmirror/hook"
+HOOK_IFACE = "dev.kieran.screenmirror.Hook"
+HOOK_SIGNAL = "PointerMoved"
+
+INSTALL_HOOK_JS = r"""
+(() => {
+    // Clean up any old captured-event style hook from prior versions.
+    if (global._kdrMirrorHookId) {
+        try { global.stage.disconnect(global._kdrMirrorHookId); } catch (e) {}
+        delete global._kdrMirrorHookId;
+    }
+    if (global._kdrMirrorTimeoutId) {
+        GLib.source_remove(global._kdrMirrorTimeoutId);
+        delete global._kdrMirrorTimeoutId;
+    }
+    if (global._kdrFsTimerId) {
+        GLib.source_remove(global._kdrFsTimerId);
+        delete global._kdrFsTimerId;
+    }
+    const conn = Gio.DBus.session;
+    global._kdrLastX = -99999;
+    global._kdrLastY = -99999;
+    global._kdrMirrorTimeoutId = GLib.timeout_add(
+        GLib.PRIORITY_DEFAULT, 16,
+        () => {
+            const [x, y] = global.get_pointer();
+            const ix = Math.round(x), iy = Math.round(y);
+            if (ix !== global._kdrLastX || iy !== global._kdrLastY) {
+                global._kdrLastX = ix;
+                global._kdrLastY = iy;
+                try {
+                    conn.emit_signal(null, '%s', '%s', '%s',
+                        new GLib.Variant('(ii)', [ix, iy]));
+                } catch (e) {}
+            }
+            return GLib.SOURCE_CONTINUE;
+        }
+    );
+    // Fullscreen-per-monitor poll (250ms is plenty — fullscreen state
+    // changes are user-driven, not animated). Emits on transition.
+    global._kdrFsState = {};
+    global._kdrFsTimerId = GLib.timeout_add(
+        GLib.PRIORITY_DEFAULT, 250,
+        () => {
+            const d = global.display;
+            const n = d.get_n_monitors();
+            for (let i = 0; i < n; i++) {
+                const g = d.get_monitor_geometry(i);
+                const fs = d.get_monitor_in_fullscreen(i);
+                const key = g.x + ',' + g.y;
+                if (global._kdrFsState[key] !== fs) {
+                    global._kdrFsState[key] = fs;
+                    try {
+                        conn.emit_signal(null, '%s', '%s', '%s',
+                            new GLib.Variant('(iiiib)',
+                                [g.x, g.y, g.width, g.height, fs]));
+                    } catch (e) {}
+                }
+            }
+            return GLib.SOURCE_CONTINUE;
+        }
+    );
+    // Focused-window broadcaster: emits app icon + app name + window
+    // title whenever focus changes (and once on install).
+    const tracker = Shell.WindowTracker.get_default();
+    const emitFocus = () => {
+        const w = global.display.get_focus_window();
+        let iconStr = '', appName = '', title = '';
+        if (w) {
+            try { title = w.get_title() || ''; } catch (e) {}
+            try {
+                const app = tracker.get_window_app(w);
+                if (app) {
+                    try { appName = app.get_name() || ''; } catch (e) {}
+                    try {
+                        const icon = app.get_icon();
+                        if (icon) iconStr = icon.to_string() || '';
+                    } catch (e) {}
+                }
+            } catch (e) {}
+        }
+        try {
+            conn.emit_signal(null, '%s', '%s', '%s',
+                new GLib.Variant('(sss)', [iconStr, appName, title]));
+        } catch (e) {}
+    };
+    if (global._kdrFocusHandlerId) {
+        try { global.display.disconnect(global._kdrFocusHandlerId); } catch (e) {}
+    }
+    global._kdrFocusHandlerId = global.display.connect('notify::focus-window', emitFocus);
+    // Also re-emit on title change of the currently focused window
+    // (apps update titles independently of focus changes).
+    const rebindTitle = () => {
+        if (global._kdrTitleHandler) {
+            try { global._kdrTitleHandlerWin.disconnect(global._kdrTitleHandler); } catch (e) {}
+        }
+        global._kdrTitleHandler = 0;
+        const w = global.display.get_focus_window();
+        if (w) {
+            global._kdrTitleHandlerWin = w;
+            global._kdrTitleHandler = w.connect('notify::title', emitFocus);
+        }
+    };
+    if (global._kdrFocusRebindId) {
+        try { global.display.disconnect(global._kdrFocusRebindId); } catch (e) {}
+    }
+    global._kdrFocusRebindId = global.display.connect('notify::focus-window', rebindTitle);
+    rebindTitle();
+    emitFocus();
+    return 'installed';
+})()
+""" % (HOOK_PATH, HOOK_IFACE, HOOK_SIGNAL,
+       HOOK_PATH, HOOK_IFACE, "MonitorFullscreen",
+       HOOK_PATH, HOOK_IFACE, "FocusInfo")
+
+UNINSTALL_HOOK_JS = r"""
+(() => {
+    let removed = [];
+    if (global._kdrMirrorTimeoutId) {
+        GLib.source_remove(global._kdrMirrorTimeoutId);
+        delete global._kdrMirrorTimeoutId;
+        removed.push('pointer');
+    }
+    if (global._kdrFsTimerId) {
+        GLib.source_remove(global._kdrFsTimerId);
+        delete global._kdrFsTimerId;
+        removed.push('fullscreen');
+    }
+    for (const k of ['_kdrFocusHandlerId', '_kdrFocusRebindId']) {
+        if (global[k]) {
+            try { global.display.disconnect(global[k]); } catch (e) {}
+            delete global[k];
+        }
+    }
+    if (global._kdrTitleHandler && global._kdrTitleHandlerWin) {
+        try { global._kdrTitleHandlerWin.disconnect(global._kdrTitleHandler); } catch (e) {}
+        delete global._kdrTitleHandler;
+        delete global._kdrTitleHandlerWin;
+    }
+    return removed.join(',') || 'not installed';
+})()
+"""
+
+HOOK_FS_SIGNAL = "MonitorFullscreen"
+HOOK_FOCUS_SIGNAL = "FocusInfo"
+
+# Aspect ratio of the projector viewport. When a source monitor is wider
+# (or taller) than this, we crop to a 16:9 window of the source centered
+# on the cursor and pan it as the cursor moves. Keeps the projector at
+# native resolution instead of letterboxing or shrinking the whole monitor.
+ASPECT_W = 16
+ASPECT_H = 9
+
+
+_shell_proxy_cache: Optional[Gio.DBusProxy] = None
+
+
+def _shell_proxy() -> Gio.DBusProxy:
+    global _shell_proxy_cache
+    if _shell_proxy_cache is None:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        _shell_proxy_cache = Gio.DBusProxy.new_sync(
+            bus, Gio.DBusProxyFlags.NONE, None,
+            SHELL_BUS, SHELL_PATH, SHELL_IFACE, None,
+        )
+    return _shell_proxy_cache
+
+
+def get_cursor_xy() -> tuple:
+    """Return current pointer (x, y) in shell logical coordinates.
+
+    Uses org.gnome.Shell.Eval('global.get_pointer()'), which requires
+    unsafe-mode to be enabled on the running shell. The
+    kierandrewett/gnome-shell jailbreak fork enables it by default; on
+    stock gnome-shell, this raises until unsafe-mode is toggled via
+    Looking Glass (Alt+F2 -> lg -> `r(true)`).
+    """
+    proxy = _shell_proxy()
+    res = proxy.call_sync(
+        "Eval",
+        GLib.Variant("(s)", ("global.get_pointer()",)),
+        Gio.DBusCallFlags.NONE, -1, None,
+    )
+    success, payload = res.unpack()
+    if not success:
+        raise RuntimeError(
+            "Shell.Eval rejected get_pointer() — unsafe-mode is off. "
+            "Install the kierandrewett/gnome-shell fork or run Alt+F2 -> lg -> r(true)."
+        )
+    arr = json.loads(payload)
+    return (int(arr[0]), int(arr[1]))
+
+
+def fetch_display_state(dc_proxy: Gio.DBusProxy):
+    """Return (logical_monitors, layout_mode) usable for hit-testing.
+
+    logical_monitors is a list of dicts: {x, y, w, h, connector, primary}
+    where w/h are in cursor-space (logical) pixels.
+    """
+    res = dc_proxy.call_sync("GetCurrentState", None, Gio.DBusCallFlags.NONE, -1, None).unpack()
+    serial, monitors_raw, logical_raw, props = res
+    layout_mode = int(props.get("layout-mode", 1))
+
+    # connector -> current (w, h)
+    cur_size = {}
+    for (spec, modes_raw, _mp) in monitors_raw:
+        connector = spec[0]
+        for (mid, w, h, _r, _ps, _ss, mode_props) in modes_raw:
+            if mode_props.get("is-current"):
+                cur_size[connector] = (w, h)
+                break
+
+    out = []
+    for (x, y, scale, transform, primary, lm_monitors, _lp) in logical_raw:
+        if not lm_monitors:
+            continue
+        connector = lm_monitors[0][0]
+        if connector not in cur_size:
+            continue
+        w_phys, h_phys = cur_size[connector]
+        if transform in (1, 3, 5, 7):
+            w_phys, h_phys = h_phys, w_phys
+        if layout_mode == 1:
+            w_log = int(round(w_phys / scale))
+            h_log = int(round(h_phys / scale))
+        else:
+            w_log, h_log = w_phys, h_phys
+        out.append({
+            "x": x, "y": y, "w": w_log, "h": h_log,
+            "w_phys": w_phys, "h_phys": h_phys, "scale": float(scale),
+            "connector": connector, "primary": bool(primary),
+        })
+    return out, layout_mode
+
+
+def find_logical_for_point(logical_monitors, cx: int, cy: int) -> Optional[dict]:
+    for lm in logical_monitors:
+        if lm["x"] <= cx < lm["x"] + lm["w"] and lm["y"] <= cy < lm["y"] + lm["h"]:
+            return lm
+    return None
+
+
+def find_primary(logical_monitors) -> Optional[dict]:
+    for lm in logical_monitors:
+        if lm["primary"]:
+            return lm
+    return logical_monitors[0] if logical_monitors else None
+
+
+class Mirror:
+    def __init__(self, projector: str, poll_ms: int = 200, zoom: float = 1.5,
+                 pan_mode: str = "center", deadzone: float = 0.5,
+                 overspill: float = 0.15, verbose: bool = False):
+        self.projector = projector
+        # Periodic safety-net interval; primary updates come via the
+        # shell-side pointer signal.
+        self.poll_ms = poll_ms
+        self.zoom = max(0.05, zoom)
+        # pan_mode: "edge" (game-camera; cursor moves freely until it
+        # hits a deadzone edge, then the camera shifts) or "center"
+        # (cursor always at projector center).
+        self.pan_mode = pan_mode if pan_mode in ("edge", "center") else "edge"
+        self.deadzone = max(0.0, min(0.95, deadzone))
+        # How far past the source edge the pan can wander, as a fraction
+        # of projector size on each axis. 0 = source always covers
+        # projector fully; >0 lets cursor at the source edge get more
+        # visible "space" around it (and black appears on the far side).
+        self.overspill = max(0.0, min(0.9, overspill))
+        self.verbose = verbose
+
+        Gst.init(None)
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.sc_proxy = Gio.DBusProxy.new_sync(
+            self.bus, Gio.DBusProxyFlags.NONE, None,
+            SC_BUS, SC_PATH, SC_IFACE, None,
+        )
+        self.dc_proxy = Gio.DBusProxy.new_sync(
+            self.bus, Gio.DBusProxyFlags.NONE, None,
+            DC_BUS, DC_PATH, DC_IFACE, None,
+        )
+        # Cache display state; refresh on MonitorsChanged. Cheap polling.
+        self._lms_cache: list = []
+        self._layout_mode_cache: int = 1
+        self._refresh_display_cache()
+        self.dc_proxy.connect("g-signal", self._on_dc_signal)
+
+        # Latest cursor pushed by the in-shell hook (set via D-Bus signal).
+        # Seeded from a one-shot Eval at startup so we have a position
+        # before the first pointer motion arrives.
+        self._cursor_xy: Optional[tuple] = None
+        # Lens auto-hide: timer id and idle threshold. The cursor view
+        # passed to the paintable is set to None when no movement for
+        # `lens_idle_ms` so the magnifier disappears.
+        self._lens_idle_ms = 1500
+        self._lens_hide_timer = 0
+        # Fullscreen state from the shell hook, keyed by (x, y) of each
+        # monitor's logical origin. When the cursor's source monitor is
+        # fullscreen, we swap to aspect-fit "as is" mode.
+        self._fs_by_xy: dict = {}
+        self._fs_active: bool = False
+        # Source-switch banner animation: tick_id + fade params.
+        self._banner_tick_id = 0
+        self._banner_t0 = 0.0
+        self._banner_hold_ms = 1200
+        self._banner_fade_ms = 2200
+        self._install_shell_hook()
+        # Subscribe to the fullscreen-change signal pushed by the same
+        # hook (separate signal, same path/iface).
+        try:
+            self.bus.signal_subscribe(
+                None, HOOK_IFACE, HOOK_FS_SIGNAL, HOOK_PATH, None,
+                Gio.DBusSignalFlags.NONE, self._on_fs_signal,
+            )
+        except Exception as e:
+            print(f"fullscreen signal subscribe failed: {e}", file=sys.stderr)
+        # Focus-info chip subscription.
+        try:
+            self.bus.signal_subscribe(
+                None, HOOK_IFACE, HOOK_FOCUS_SIGNAL, HOOK_PATH, None,
+                Gio.DBusSignalFlags.NONE, self._on_focus_signal,
+            )
+        except Exception as e:
+            print(f"focus signal subscribe failed: {e}", file=sys.stderr)
+        # Top-right clock: tick once a second.
+        GLib.timeout_add_seconds(1, self._tick_clock)
+        GLib.idle_add(self._tick_clock)
+        # Cached focus info so it survives paintable rebuilds when the
+        # source monitor switches.
+        self._last_focus: Optional[tuple] = None
+        # Keep mirror window above everything. Mutter only honors the
+        # "above" hint persistently when nothing else takes it, so we
+        # re-assert every few seconds in case another window claimed
+        # the top.
+        GLib.timeout_add_seconds(3, self._enforce_window_above)
+        # Keyboard overlay state: rolling raw-stroke history. Each
+        # stroke is {"kind":"char|space|chord", ...}. Displayed items
+        # are derived by walking history (consecutive chars coalesce
+        # into one word, separated by space strokes). Backspace pops
+        # the last stroke — so an extra backspace is correctly spent
+        # eating a typed space.
+        self._key_strokes: list = []
+        self._key_items: list = []         # derived from _key_strokes
+        self._key_visible_ms = 2500        # full-alpha hold time (ms)
+        self._key_fade_ms = 4000           # total lifetime (ms)
+        self._key_tick_id = 0
+        self._caps_on = False              # toggled on Caps Lock key
+        self._install_key_listener()
+
+        self.window: Optional[Gtk.ApplicationWindow] = None
+        self.picture: Optional[Gtk.Picture] = None
+        self.status_label: Optional[Gtk.Label] = None
+
+        self.session_proxy: Optional[Gio.DBusProxy] = None
+        self.stream_proxy: Optional[Gio.DBusProxy] = None
+        self.stream_signal_id = 0
+        self.pipeline: Optional[Gst.Pipeline] = None
+
+        self.current_source: Optional[str] = None
+        self.pending_source: Optional[str] = None
+
+        # Set when a pipeline is live: src_info holds logical / physical
+        # dims of the source monitor; disp_w/disp_h are the Picture's
+        # size in projector-logical pixels (cached for pan math).
+        self.src_info: Optional[dict] = None
+        self.disp_w: Optional[int] = None
+        self.disp_h: Optional[int] = None
+
+    def _refresh_display_cache(self):
+        try:
+            self._lms_cache, self._layout_mode_cache = fetch_display_state(self.dc_proxy)
+        except Exception as e:
+            if self.verbose:
+                print(f"display-state refresh failed: {e}", file=sys.stderr)
+
+    def _on_dc_signal(self, _proxy, _sender, signal: str, _params):
+        if signal == "MonitorsChanged":
+            self._refresh_display_cache()
+
+    def _install_shell_hook(self):
+        # Subscribe to the custom signal first so we don't miss anything
+        # the hook emits between install and subscribe.
+        self.bus.signal_subscribe(
+            None, HOOK_IFACE, HOOK_SIGNAL, HOOK_PATH, None,
+            Gio.DBusSignalFlags.NONE, self._on_pointer_signal,
+        )
+        try:
+            res = _shell_proxy().call_sync(
+                "Eval", GLib.Variant("(s)", (INSTALL_HOOK_JS,)),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+            ok, payload = res.unpack()
+            if not ok and self.verbose:
+                print(f"hook install Eval rejected: {payload}", file=sys.stderr)
+            elif self.verbose:
+                print(f"shell hook: {payload}")
+        except Exception as e:
+            print(f"shell-hook install failed: {e}", file=sys.stderr)
+
+        # Seed cursor pos via one-shot Eval so we have something before
+        # the user moves the mouse.
+        try:
+            self._cursor_xy = get_cursor_xy()
+        except Exception:
+            pass
+
+    def _on_pointer_signal(self, _conn, _sender, _path, _iface, _signal, params):
+        try:
+            x, y = params.unpack()
+            x, y = int(x), int(y)
+            moved = (x, y) != self._cursor_xy
+            self._cursor_xy = (x, y)
+            self._process_cursor(x, y)
+            if self._wrapped_paintable is not None:
+                view = getattr(self, "_last_cursor_view", None)
+                if view is not None:
+                    # Anchor stays attached to the cursor regardless of
+                    # lens state so the key overlay keeps following.
+                    self._wrapped_paintable.set_anchor_view(view[0], view[1])
+            if moved and self._wrapped_paintable is not None:
+                view = None
+                if not self._fs_active:
+                    view = getattr(self, "_last_cursor_view", None)
+                else:
+                    # In fullscreen-fit mode the source is rendered at
+                    # (render_size) centered on (dx, dy); map the cursor
+                    # into that view.
+                    si = self.src_info
+                    if si is not None:
+                        scale = self._wrapped_paintable._rw / si["w"]
+                        cx_src = self._cursor_xy[0] - si["x"]
+                        cy_src = self._cursor_xy[1] - si["y"]
+                        view = (
+                            self._wrapped_paintable._dx + cx_src * scale,
+                            self._wrapped_paintable._dy + cy_src * scale,
+                        )
+                if view is not None:
+                    self._wrapped_paintable.set_cursor_view(view[0], view[1])
+                # Schedule lens hide-on-idle (reset on every motion).
+                if self._lens_hide_timer:
+                    GLib.source_remove(self._lens_hide_timer)
+                self._lens_hide_timer = GLib.timeout_add(
+                    self._lens_idle_ms, self._hide_lens,
+                )
+        except Exception as e:
+            if self.verbose:
+                print(f"pointer signal error: {e}", file=sys.stderr)
+
+    def _hide_lens(self) -> bool:
+        self._lens_hide_timer = 0
+        if self._wrapped_paintable is not None:
+            self._wrapped_paintable.set_cursor_view(None, None)
+        return False  # one-shot
+
+    def _on_fs_signal(self, _conn, _sender, _path, _iface, _signal, params):
+        try:
+            x, y, _w, _h, is_fs = params.unpack()
+            self._fs_by_xy[(int(x), int(y))] = bool(is_fs)
+            self._sync_fs_mode()
+        except Exception as e:
+            if self.verbose:
+                print(f"fs signal error: {e}", file=sys.stderr)
+
+    def _enforce_window_above(self) -> bool:
+        # Find our mirror window in Mutter and make_above + raise it.
+        # Wayland clients can't set this themselves, but our jailbroken
+        # gnome-shell lets us drive it via Eval.
+        js = """
+        (() => {
+            const wins = global.display.list_all_windows();
+            for (const w of wins) {
+                const cls = w.get_wm_class() || '';
+                if (cls.toLowerCase().includes('screenmirror')) {
+                    try { if (!w.above) w.make_above(); } catch (e) {}
+                    try { w.raise_and_make_recent(); } catch (e) {}
+                    return 'ok';
+                }
+            }
+            return 'no window';
+        })()
+        """
+        try:
+            _shell_proxy().call_sync(
+                "Eval", GLib.Variant("(s)", (js,)),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"window-above enforce failed: {e}", file=sys.stderr)
+        return True  # keep ticking
+
+    def _tick_clock(self) -> bool:
+        if self._wrapped_paintable is not None:
+            from datetime import datetime
+            now = datetime.now()
+            self._wrapped_paintable.set_clock_text(now.strftime("%H:%M"))
+            # After 20:00 (8 pm), tint the fullscreen letterbox bars
+            # gray instead of pitch black — easier on the eyes in a
+            # darkened room.
+            if now.hour >= 20:
+                self._wrapped_paintable.set_fs_bg(0.18, 0.18, 0.18)
+            else:
+                self._wrapped_paintable.set_fs_bg(0.0, 0.0, 0.0)
+        return True  # keep ticking
+
+    def _on_focus_signal(self, _conn, _sender, _path, _iface, _signal, params):
+        try:
+            icon_str, app_name, title = params.unpack()
+            icon_paintable = self._resolve_icon(icon_str) if icon_str else None
+            self._last_focus = (icon_paintable, app_name, title)
+            if self._wrapped_paintable is not None:
+                self._wrapped_paintable.set_focus_info(icon_paintable, app_name, title)
+        except Exception as e:
+            if self.verbose:
+                print(f"focus signal error: {e}", file=sys.stderr)
+
+    def _resolve_icon(self, icon_str: str) -> Optional[Gdk.Paintable]:
+        """Turn an Atspi/Gio serialized icon string into a Gdk.Paintable
+        the painter can snapshot. Returns None if the icon can't be
+        resolved (rare apps with no icon)."""
+        try:
+            icon = Gio.Icon.new_for_string(icon_str)
+        except Exception:
+            return None
+        if icon is None:
+            return None
+        try:
+            display = Gdk.Display.get_default()
+            theme = Gtk.IconTheme.get_for_display(display)
+        except Exception:
+            return None
+        # GIcon may be a ThemedIcon (search names) or a FileIcon.
+        try:
+            if isinstance(icon, Gio.ThemedIcon):
+                names = icon.get_names() or []
+                for name in names:
+                    paintable = theme.lookup_icon(
+                        name, None, 48, 1, Gtk.TextDirection.NONE, 0,
+                    )
+                    if paintable is not None:
+                        return paintable
+                return None
+            if isinstance(icon, Gio.FileIcon):
+                f = icon.get_file()
+                try:
+                    tex = Gdk.Texture.new_from_file(f)
+                    return tex
+                except Exception:
+                    return None
+        except Exception:
+            pass
+        return None
+
+    def _source_is_fullscreen(self) -> bool:
+        if not self.current_source:
+            return False
+        for lm in self._lms_cache:
+            if lm["connector"] == self.current_source:
+                return self._fs_by_xy.get((lm["x"], lm["y"]), False)
+        return False
+
+    def _start_banner(self, text: str):
+        if self._wrapped_paintable is None:
+            return
+        import time
+        self._banner_text_str = text or ""
+        self._banner_t0 = time.monotonic()
+        self._wrapped_paintable.set_banner(self._banner_text_str, 1.0)
+        if self._banner_tick_id == 0:
+            self._banner_tick_id = GLib.timeout_add(33, self._banner_tick)
+
+    def _banner_tick(self) -> bool:
+        if self._wrapped_paintable is None:
+            self._banner_tick_id = 0
+            return False
+        import time
+        age_ms = (time.monotonic() - self._banner_t0) * 1000.0
+        if age_ms < self._banner_hold_ms:
+            alpha = 1.0
+        elif age_ms < self._banner_fade_ms:
+            alpha = 1.0 - (age_ms - self._banner_hold_ms) / max(
+                1.0, self._banner_fade_ms - self._banner_hold_ms,
+            )
+        else:
+            self._wrapped_paintable.set_banner("", 0.0)
+            self._banner_tick_id = 0
+            return False
+        self._wrapped_paintable.set_banner(self._banner_text_str, alpha)
+        return True
+
+    def _sync_fs_mode(self):
+        """Apply or clear fullscreen-fit mode based on current source's
+        fullscreen state. Idempotent."""
+        if self._wrapped_paintable is None or self.src_info is None:
+            return
+        want = self._source_is_fullscreen()
+        if want and not self._fs_active:
+            # Enter fit mode: render source aspect-fit, centered, no lens.
+            si = self.src_info
+            src_aspect = si["w"] / si["h"]
+            proj_aspect = self.proj_w / self.proj_h
+            if src_aspect > proj_aspect:
+                rw = self.proj_w
+                rh = int(round(self.proj_w / src_aspect))
+            else:
+                rh = self.proj_h
+                rw = int(round(self.proj_h * src_aspect))
+            self._wrapped_paintable.set_render_size(rw, rh)
+            self._wrapped_paintable.set_offset(
+                (self.proj_w - rw) / 2, (self.proj_h - rh) / 2,
+            )
+            self._wrapped_paintable.set_fs_mode(True)
+            self._wrapped_paintable.set_lens_zoom(3.0)
+            self._fs_active = True
+            if self.verbose:
+                print(f"fullscreen-fit: {si['w']}x{si['h']} -> {rw}x{rh} on {self.proj_w}x{self.proj_h}")
+        elif not want and self._fs_active:
+            # Leave fit mode: restore pan dims and let next cursor signal
+            # repopulate offset + lens.
+            size = self._compute_picture_size()
+            if size is not None:
+                self.disp_w, self.disp_h = size
+                self._wrapped_paintable.set_render_size(self.disp_w, self.disp_h)
+            self._wrapped_paintable.set_fs_mode(False)
+            self._wrapped_paintable.set_lens_zoom(1.5)
+            self._fs_active = False
+            if self.verbose:
+                print("fullscreen-fit: off")
+
+    def _process_cursor(self, cx: int, cy: int):
+        """React to a cursor position update: bounce off projector,
+        switch source if it moved to a different monitor, and update
+        the pan. Called from the signal handler at ~60Hz and from the
+        periodic poll as a safety net."""
+        cx, cy = self._bounce_off_projector(cx, cy)
+        target = self._cursor_target_at(cx, cy)
+        if target and target != self.current_source and target != self.pending_source:
+            self._switch_to(target)
+            return
+        if self.current_source is not None:
+            self._update_pan_for(cx, cy)
+
+    # ---- Global keyboard capture (Mutter D-Bus signal) ----
+
+    def _install_key_listener(self):
+        # Subscribes to the dev.kieran.mutter.Keys signal emitted by
+        # the patched Mutter (kierandrewett/mutter jailbreak). Falls
+        # silent if the running Mutter isn't patched — no error, just
+        # no key overlay.
+        try:
+            self.bus.signal_subscribe(
+                None, MUTTER_KEY_IFACE, MUTTER_KEY_SIGNAL, MUTTER_KEY_PATH,
+                None, Gio.DBusSignalFlags.NONE, self._on_mutter_key,
+            )
+        except Exception as e:
+            print(f"mutter key signal subscribe failed: {e}", file=sys.stderr)
+
+    # X11 keysym name table for non-printable keys (subset that's
+    # worth showing in an overlay). Add more as needed.
+    _KEYSYM_NAMES = {
+        0xff08: "⌫",  0xff09: "Tab",   0xff0d: "↵",   0xff1b: "Esc",
+        0xff50: "Home", 0xff57: "End", 0xff55: "PgUp", 0xff56: "PgDn",
+        0xff51: "←",  0xff52: "↑",   0xff53: "→",   0xff54: "↓",
+        0xffff: "Del", 0x0020: "␣",
+        0xff63: "Ins",
+        0xffe1: "Shift", 0xffe2: "Shift", 0xffe3: "Ctrl", 0xffe4: "Ctrl",
+        0xffe5: "Caps", 0xffe7: "Meta", 0xffe8: "Meta",
+        0xffe9: "Alt", 0xffea: "Alt", 0xffeb: "Super", 0xffec: "Super",
+        0xffbe: "F1", 0xffbf: "F2", 0xffc0: "F3", 0xffc1: "F4",
+        0xffc2: "F5", 0xffc3: "F6", 0xffc4: "F7", 0xffc5: "F8",
+        0xffc6: "F9", 0xffc7: "F10", 0xffc8: "F11", 0xffc9: "F12",
+    }
+
+    # ClutterModifierType bits.
+    _MOD_SHIFT = 1 << 0
+    _MOD_CTRL  = 1 << 2
+    _MOD_ALT   = 1 << 3
+    _MOD_SUPER = 1 << 6
+
+    def _format_mutter_key(self, keysym: int, state: int, unicode_cp: int) -> str:
+        # Hide bare modifier press events — they show as e.g. "Ctrl"
+        # which is noisy; only show modifiers as PREFIXES on real keys.
+        if 0xffe1 <= keysym <= 0xffee:
+            return ""
+        s = chr(unicode_cp) if unicode_cp and 0x20 <= unicode_cp < 0x10ffff else ""
+        body = ""
+        if s and s.isprintable() and s != " ":
+            body = s
+        else:
+            body = self._KEYSYM_NAMES.get(keysym, f"<{keysym:#x}>")
+        parts = []
+        if state & self._MOD_CTRL:  parts.append("Ctrl")
+        if state & self._MOD_ALT:   parts.append("Alt")
+        if state & self._MOD_SUPER: parts.append("Super")
+        # Show explicit Shift only for non-letter combos; for letters
+        # the unicode case already encodes shift.
+        if (state & self._MOD_SHIFT) and not (s and s.isalpha()):
+            parts.append("Shift")
+        parts.append(body)
+        return "+".join(parts)
+
+    def _on_mutter_key(self, _conn, _sender, _path, _iface, _signal, params):
+        import time
+        try:
+            keysym, state, unicode_cp, is_press = params.unpack()
+            if not is_press:
+                return
+            keysym = int(keysym)
+            state_int = int(state)
+            unicode_cp = int(unicode_cp)
+            now = time.monotonic()
+
+            # Track Caps Lock state. The lock bit (1<<1) reflects the
+            # state AFTER this key was processed for letters, but not
+            # for the Caps_Lock key event itself — for that key we
+            # explicitly toggle.
+            if keysym == 0xffe5:  # Caps_Lock
+                self._caps_on = not self._caps_on
+                if self._wrapped_paintable is not None:
+                    self._wrapped_paintable.set_caps_on(self._caps_on)
+            else:
+                lock_bit = bool(state_int & (1 << 1))
+                if lock_bit != self._caps_on:
+                    self._caps_on = lock_bit
+                    if self._wrapped_paintable is not None:
+                        self._wrapped_paintable.set_caps_on(self._caps_on)
+
+            if keysym == 0xff08:  # Backspace
+                if self._key_strokes:
+                    self._key_strokes.pop()
+            elif keysym == 0x0020:  # Space
+                self._key_strokes.append({"kind": "space", "t": now})
+            else:
+                has_mod = bool(state_int & (self._MOD_CTRL | self._MOD_ALT | self._MOD_SUPER))
+                ch = chr(unicode_cp) if 0x20 <= unicode_cp < 0x110000 else ""
+                is_plain_char = (
+                    ch and ch.isprintable() and not has_mod
+                    and keysym not in self._KEYSYM_NAMES
+                )
+                if is_plain_char:
+                    self._key_strokes.append({"kind": "char", "value": ch, "t": now})
+                else:
+                    text = self._format_mutter_key(keysym, state_int, unicode_cp)
+                    if text:
+                        self._key_strokes.append({"kind": "chord", "text": text, "t": now})
+
+            # Cap history; oldest get dropped.
+            if len(self._key_strokes) > 200:
+                self._key_strokes = self._key_strokes[-200:]
+
+            self._rebuild_key_items()
+            self._push_key_items()
+            self._ensure_key_tick()
+        except Exception as e:
+            if self.verbose:
+                print(f"mutter key signal error: {e}", file=sys.stderr)
+
+    def _rebuild_key_items(self):
+        """Derive _key_items from _key_strokes. Consecutive char
+        strokes coalesce into a single word; each space starts a new
+        word; chord strokes are standalone items. A word's timestamp
+        is the max of its char strokes so it inherits the freshest
+        edit time (handy for fade timing)."""
+        items = []
+        cur_word = None
+        for s in self._key_strokes:
+            k = s["kind"]
+            if k == "char":
+                if cur_word is None:
+                    cur_word = {"text": s["value"], "t": s["t"]}
+                    items.append(cur_word)
+                else:
+                    cur_word["text"] += s["value"]
+                    if s["t"] > cur_word["t"]:
+                        cur_word["t"] = s["t"]
+            elif k == "space":
+                cur_word = None
+            elif k == "chord":
+                items.append({"text": s["text"], "t": s["t"]})
+                cur_word = None
+        self._key_items = items
+
+    def _push_key_items(self):
+        """Compute per-item alphas and shove into the paintable. Strokes
+        whose contribution has fully faded get garbage-collected so
+        history stays small."""
+        import time
+        now = time.monotonic()
+        fade_s = self._key_fade_ms / 1000.0
+        visible_s = self._key_visible_ms / 1000.0
+        rendered = []
+        for item in self._key_items:
+            age = now - item["t"]
+            if age >= fade_s:
+                continue
+            if age <= visible_s:
+                alpha = 1.0
+            else:
+                alpha = 1.0 - (age - visible_s) / max(0.001, fade_s - visible_s)
+            rendered.append((item["text"], max(0.0, min(1.0, alpha))))
+        # Drop strokes older than fade window so they can no longer be
+        # surfaced via subsequent backspaces.
+        self._key_strokes = [s for s in self._key_strokes if (now - s["t"]) < fade_s]
+        if self._wrapped_paintable is not None:
+            self._wrapped_paintable.set_key_items(rendered)
+
+    def _ensure_key_tick(self):
+        if self._key_tick_id or not self._key_items:
+            return
+        # ~60Hz redraw while keys are on screen.
+        self._key_tick_id = GLib.timeout_add(33, self._key_tick)
+
+    def _key_tick(self) -> bool:
+        self._rebuild_key_items()
+        self._push_key_items()
+        if not self._key_items:
+            self._key_tick_id = 0
+            return False
+        return True
+
+    # ---- UI ----
+
+    def find_projector_monitor(self) -> Optional[Gdk.Monitor]:
+        d = Gdk.Display.get_default()
+        ms = d.get_monitors()
+        for i in range(ms.get_n_items()):
+            m = ms.get_item(i)
+            if m.get_connector() == self.projector:
+                return m
+        return None
+
+    def build_window(self, app: Gtk.Application):
+        self.window = Gtk.ApplicationWindow(application=app, title=f"screen-mirror -> {self.projector}")
+        self.window.set_decorated(False)
+        self.window.set_resizable(False)
+        # Refuse close requests so the projector stays mirrored. The
+        # process must be killed externally to stop.
+        self.window.connect("close-request", lambda _w: True)
+
+        # Picture is pinned to the projector's exact size — the
+        # PanningPaintable wrapper internally handles translation of the
+        # source frame, so nothing renders outside the projector area
+        # and the window can't end up wider than the monitor.
+        self.picture = Gtk.Picture()
+        self.picture.set_can_shrink(True)
+        self.picture.set_content_fit(Gtk.ContentFit.FILL)
+        self.picture.set_hexpand(True)
+        self.picture.set_vexpand(True)
+
+        overlay = Gtk.Overlay()
+        overlay.set_child(self.picture)
+        self.status_label = Gtk.Label(label="waiting for cursor…")
+        self.status_label.set_halign(Gtk.Align.CENTER)
+        self.status_label.set_valign(Gtk.Align.CENTER)
+        self.status_label.add_css_class("status")
+        overlay.add_overlay(self.status_label)
+
+        self.window.set_child(overlay)
+
+        css = Gtk.CssProvider()
+        css.load_from_string(
+            "window { background: white; }"
+            ".status { color: #444; font-size: 24px; }"
+        )
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER,
+        )
+
+        mon = self.find_projector_monitor()
+        if mon is None:
+            print(f"ERROR: projector {self.projector!r} not in Gdk monitors. "
+                  f"Make sure it's connected and enabled in display settings.", file=sys.stderr)
+            app.quit()
+            return
+
+        # Projector logical dimensions — pan math operates in this space.
+        geom = mon.get_geometry()
+        self.proj_w = geom.width
+        self.proj_h = geom.height
+
+        # Pin the window size to the projector so even before the
+        # compositor honors fullscreen, the chrome-less window is the
+        # right shape rather than the GTK default 640x480.
+        self.window.set_default_size(self.proj_w, self.proj_h)
+        self.window.fullscreen_on_monitor(mon)
+        self.window.present()
+
+        GLib.timeout_add(self.poll_ms, self._poll_cursor)
+        GLib.idle_add(self._initial_source)
+
+    def set_status(self, text: str):
+        if self.status_label is not None:
+            self.status_label.set_text(text)
+            self.status_label.set_visible(bool(text))
+
+    # ---- cursor / source selection ----
+
+    def _initial_source(self) -> bool:
+        try:
+            cx, cy = get_cursor_xy()
+            target = self._cursor_target_at(cx, cy)
+        except Exception as e:
+            print(f"initial cursor lookup failed: {e}", file=sys.stderr)
+            target = None
+        if target is None:
+            primary = find_primary(
+                [lm for lm in self._lms_cache if lm["connector"] != self.projector]
+            )
+            target = primary["connector"] if primary else None
+        if target is not None:
+            self._switch_to(target)
+        return False  # one-shot
+
+    def _cursor_target_at(self, cx: int, cy: int) -> Optional[str]:
+        """Return the connector under (cx, cy), or None if on projector / off-screen."""
+        lm = find_logical_for_point(self._lms_cache, cx, cy)
+        if lm is None:
+            return None
+        if lm["connector"] == self.projector:
+            return None
+        return lm["connector"]
+
+    def _warp_cursor(self, x: int, y: int):
+        """Move the system cursor to (x, y) via the Mutter backend seat."""
+        try:
+            _shell_proxy().call_sync(
+                "Eval",
+                GLib.Variant("(s)", (
+                    f"global.backend.get_default_seat().warp_pointer({int(x)}, {int(y)})",
+                )),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"warp failed: {e}", file=sys.stderr)
+
+    def _bounce_off_projector(self, cx: int, cy: int) -> tuple:
+        """If cursor entered the projector's logical area, warp it back to the
+        nearest valid (non-projector) monitor and return the new coords.
+        Otherwise return (cx, cy) unchanged.
+        """
+        projector_lm = next(
+            (lm for lm in self._lms_cache if lm["connector"] == self.projector), None,
+        )
+        if projector_lm is None:
+            return (cx, cy)
+        if not (projector_lm["x"] <= cx < projector_lm["x"] + projector_lm["w"]
+                and projector_lm["y"] <= cy < projector_lm["y"] + projector_lm["h"]):
+            return (cx, cy)
+
+        # Prefer the monitor we were just mirroring; fall back to any
+        # non-projector monitor.
+        anchor = None
+        if self.current_source:
+            anchor = next(
+                (lm for lm in self._lms_cache if lm["connector"] == self.current_source),
+                None,
+            )
+        if anchor is None:
+            anchor = next(
+                (lm for lm in self._lms_cache if lm["connector"] != self.projector),
+                None,
+            )
+        if anchor is None:
+            return (cx, cy)
+
+        new_x = max(anchor["x"], min(anchor["x"] + anchor["w"] - 1, cx))
+        new_y = max(anchor["y"], min(anchor["y"] + anchor["h"] - 1, cy))
+        self._warp_cursor(new_x, new_y)
+        return (new_x, new_y)
+
+    def _poll_cursor(self) -> bool:
+        # Pan + source-switch are driven by the in-shell pointer signal
+        # (see _on_pointer_signal). This periodic tick is just a safety
+        # net for the case where signals stop flowing (e.g. shell
+        # restart). It re-runs processing from the last cached cursor.
+        if self._cursor_xy is not None:
+            self._process_cursor(*self._cursor_xy)
+        return True
+
+    # ---- 16:9 pan (GTK widget translation, no pipeline involvement) ----
+
+    def _compute_picture_size(self) -> Optional[tuple]:
+        """Compute the Picture widget's display size in projector logical
+        pixels so the source's full frame fits the projector along the
+        bound axis, leaving room to pan along the other.
+
+        Returns (disp_w, disp_h) in projector-logical pixels, or None.
+        """
+        si = self.src_info
+        if si is None or not getattr(self, "proj_w", None):
+            return None
+        # Default: fill the projector — pick the larger scale so neither
+        # axis leaves black bars. For an ultrawide source on a 16:9
+        # projector this means the height fills and width overflows, so
+        # the cursor drives horizontal pan. User-supplied --zoom
+        # multiplies on top (1.0 = fill; <1 letterboxes; >1 zooms in more).
+        src_w_log = si["w"]
+        src_h_log = si["h"]
+        sx = self.proj_w / src_w_log
+        sy = self.proj_h / src_h_log
+        s = max(sx, sy) * self.zoom
+        disp_w = int(round(src_w_log * s))
+        disp_h = int(round(src_h_log * s))
+        return (disp_w, disp_h)
+
+    def _update_pan_for(self, cx: int, cy: int):
+        """Update the source-render offset so the cursor stays visible.
+
+        center mode: cursor always at projector midpoint.
+        edge mode: cursor moves freely within a central deadzone; only
+        when the cursor approaches the projector edge does the camera
+        shift to keep the cursor visible. Feels like panning a map.
+        """
+        if self.src_info is None or self._wrapped_paintable is None:
+            return
+        if not self.disp_w:
+            return
+        # When the source app is fullscreen we render aspect-fit and
+        # don't pan at all; skip everything.
+        if self._fs_active:
+            return
+        si = self.src_info
+        cx_src = cx - si["x"]
+        cy_src = cy - si["y"]
+        scale = self.disp_w / si["w"]
+        cx_disp = cx_src * scale
+        cy_disp = cy_src * scale
+
+        if self.pan_mode == "center" or not self._wrapped_paintable:
+            off_x = self.proj_w / 2 - cx_disp
+            off_y = self.proj_h / 2 - cy_disp
+        else:
+            # Edge mode: only shift offset when the cursor's projector
+            # position leaves the deadzone. The deadzone is centered,
+            # `deadzone` fraction of the projector wide/tall.
+            cur_off_x = self._wrapped_paintable._dx
+            cur_off_y = self._wrapped_paintable._dy
+            view_x = cx_disp + cur_off_x
+            view_y = cy_disp + cur_off_y
+            margin_x = (1.0 - self.deadzone) * 0.5 * self.proj_w
+            margin_y = (1.0 - self.deadzone) * 0.5 * self.proj_h
+            left, right = margin_x, self.proj_w - margin_x
+            top, bottom = margin_y, self.proj_h - margin_y
+            off_x = cur_off_x
+            off_y = cur_off_y
+            if view_x < left:
+                off_x += (left - view_x)
+            elif view_x > right:
+                off_x -= (view_x - right)
+            if view_y < top:
+                off_y += (top - view_y)
+            elif view_y > bottom:
+                off_y -= (view_y - bottom)
+
+        # Allow pan to overspill by `overspill` fraction of projector size
+        # along each axis. With overspill > 0, the cursor can drive the
+        # view far enough that the source's edge passes the projector
+        # center — black bars appear on the far side, but content at the
+        # source's edge gets visible space around it. 0.0 = original
+        # behavior (source always covers projector fully).
+        overspill_x = self.proj_w * self.overspill
+        overspill_y = self.proj_h * self.overspill
+        if self.disp_w >= self.proj_w:
+            max_off = overspill_x
+            min_off = self.proj_w - self.disp_w - overspill_x
+            off_x = max(min_off, min(max_off, off_x))
+        else:
+            off_x = (self.proj_w - self.disp_w) / 2
+        if self.disp_h >= self.proj_h:
+            max_off = overspill_y
+            min_off = self.proj_h - self.disp_h - overspill_y
+            off_y = max(min_off, min(max_off, off_y))
+        else:
+            off_y = (self.proj_h - self.disp_h) / 2
+        self._wrapped_paintable.set_offset(off_x, off_y)
+        # Cache the cursor's view position so _on_pointer_signal can
+        # push it into the paintable on actual movement. We don't push
+        # it here because _update_pan_for also runs from the safety-net
+        # poll using cached coords — pushing here would resurrect the
+        # lens immediately after the idle-hide timer cleared it.
+        self._last_cursor_view = (cx_disp + off_x, cy_disp + off_y)
+
+    def _update_pan(self):
+        try:
+            cx, cy = get_cursor_xy()
+        except Exception:
+            return
+        self._update_pan_for(cx, cy)
+
+    # ---- ScreenCast session lifecycle ----
+
+    def _switch_to(self, connector: str):
+        if self.verbose:
+            print(f"switching {self.current_source or '(none)'} -> {connector}")
+        self.pending_source = connector
+        self._teardown()
+        self.set_status(f"capturing {connector}…")
+        try:
+            self._start_capture(connector)
+        except GLib.Error as e:
+            print(f"failed to start capture for {connector}: {e.message}", file=sys.stderr)
+            self.pending_source = None
+            self.set_status(f"error: {e.message}")
+
+    def _teardown(self):
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+        self.src_info = None
+        self.disp_w = None
+        self.disp_h = None
+        if getattr(self, "_wrapped_paintable", None) is not None:
+            self._wrapped_paintable.detach()
+            self._wrapped_paintable = None
+        if self.picture is not None:
+            self.picture.set_paintable(None)
+        if self.stream_proxy is not None and self.stream_signal_id:
+            try:
+                self.stream_proxy.disconnect(self.stream_signal_id)
+            except Exception:
+                pass
+        self.stream_signal_id = 0
+        self.stream_proxy = None
+        if self.session_proxy is not None:
+            try:
+                self.session_proxy.call_sync("Stop", None, Gio.DBusCallFlags.NONE, -1, None)
+            except Exception:
+                pass
+            self.session_proxy = None
+        self.current_source = None
+
+    def _start_capture(self, connector: str):
+        # CreateSession({})
+        res = self.sc_proxy.call_sync(
+            "CreateSession",
+            GLib.Variant("(a{sv})", ({},)),
+            Gio.DBusCallFlags.NONE, -1, None,
+        )
+        session_path = res.unpack()[0]
+        self.session_proxy = Gio.DBusProxy.new_sync(
+            self.bus, Gio.DBusProxyFlags.NONE, None,
+            SC_BUS, session_path, SESSION_IFACE, None,
+        )
+
+        # RecordMonitor:
+        #   cursor-mode=1 (embedded — cursor baked into frame)
+        #   is-recording=true — tells Mutter we want continuous frames,
+        #     prevents direct-scanout from stalling our stream when a
+        #     fullscreen source app would otherwise bypass the
+        #     compositor's rendering path.
+        props = {
+            "cursor-mode": GLib.Variant("u", 1),
+            "is-recording": GLib.Variant("b", True),
+        }
+        res = self.session_proxy.call_sync(
+            "RecordMonitor",
+            GLib.Variant("(sa{sv})", (connector, props)),
+            Gio.DBusCallFlags.NONE, -1, None,
+        )
+        stream_path = res.unpack()[0]
+        self.stream_proxy = Gio.DBusProxy.new_sync(
+            self.bus, Gio.DBusProxyFlags.NONE, None,
+            SC_BUS, stream_path, STREAM_IFACE, None,
+        )
+        self.stream_signal_id = self.stream_proxy.connect("g-signal", self._on_stream_signal)
+
+        # Start
+        self.session_proxy.call_sync("Start", None, Gio.DBusCallFlags.NONE, -1, None)
+
+    def _on_stream_signal(self, _proxy, _sender, signal: str, params):
+        if signal == "PipeWireStreamAdded":
+            node_id = params.unpack()[0]
+            try:
+                self._build_pipeline(int(node_id))
+            except Exception as e:
+                print(f"pipeline build failed: {e}", file=sys.stderr)
+                self.set_status(f"pipeline error: {e}")
+
+    def _build_pipeline(self, node_id: int):
+        # Look up the source monitor's physical dims so we can crop in
+        # physical-pixel space (matching the pipewiresrc frame size).
+        target_connector = self.pending_source
+        src = next(
+            (lm for lm in self._lms_cache if lm["connector"] == target_connector),
+            None,
+        )
+        self.src_info = src  # may be None if monitor vanished
+
+        # No crop in the pipeline — the full source frame becomes a
+        # GdkPaintable, and panning happens by translating the Picture
+        # widget. A leaky single-buffer queue in front of the sink drops
+        # stale frames if rendering falls behind, and sync=false lets the
+        # sink render as soon as frames arrive.
+        desc = (
+            f"pipewiresrc path={node_id} do-timestamp=true "
+            f"! videoconvert ! video/x-raw,format=BGRx "
+            f"! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
+            f"! gtk4paintablesink name=sink sync=false"
+        )
+        if self.verbose:
+            print(f"pipeline: {desc}")
+        self.pipeline = Gst.parse_launch(desc)
+        sink = self.pipeline.get_by_name("sink")
+        paintable = sink.props.paintable
+        self.picture.set_paintable(paintable)
+
+        # The Picture is pinned to the projector. The PanningPaintable
+        # reports the projector size as its intrinsic, but internally
+        # renders the source at (disp_w, disp_h) with an offset we update
+        # per cursor poll. Pan updates just call set_offset — no widget
+        # relayout, no pipeline negotiation.
+        size = self._compute_picture_size()
+        if size is not None:
+            self.disp_w, self.disp_h = size
+            self._wrapped_paintable = PanningPaintable(
+                paintable, self.disp_w, self.disp_h, self.proj_w, self.proj_h,
+            )
+            self.picture.set_paintable(self._wrapped_paintable)
+        else:
+            self._wrapped_paintable = None
+            self.picture.set_paintable(paintable)
+
+        gst_bus = self.pipeline.get_bus()
+        gst_bus.add_signal_watch()
+        gst_bus.connect("message::error", self._on_gst_error)
+        gst_bus.connect("message::eos", self._on_gst_eos)
+
+        # Seed the pan position before the first frame so we don't show
+        # the source's top-left briefly while we wait for the next poll.
+        self._update_pan()
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self.current_source = self.pending_source
+        self.pending_source = None
+        # Apply fullscreen mode if the new source is already fullscreen.
+        self._fs_active = False
+        self._sync_fs_mode()
+        # Pop up a banner showing the new source's connector name.
+        self._start_banner(self.current_source)
+        # Re-apply cached focus info to the freshly built paintable; the
+        # shell only emits FocusInfo on focus changes, so without this
+        # the chip would go blank until the next focus change.
+        if self._last_focus is not None and self._wrapped_paintable is not None:
+            icon, app, title = self._last_focus
+            self._wrapped_paintable.set_focus_info(icon, app, title)
+        if self._wrapped_paintable is not None:
+            self._wrapped_paintable.set_caps_on(self._caps_on)
+        self.set_status("")  # hide overlay text once playing
+        note = ""
+        if src is not None and size is not None:
+            note = (f" (source {src['w']}x{src['h']} -> picture "
+                    f"{size[0]}x{size[1]} on {self.proj_w}x{self.proj_h} projector)")
+        print(f"mirroring {self.current_source} -> {self.projector}{note}")
+
+    def _on_gst_error(self, _bus, msg):
+        err, dbg = msg.parse_error()
+        print(f"gst error: {err.message} ({dbg})", file=sys.stderr)
+        self.set_status(f"stream error: {err.message}")
+
+    def _on_gst_eos(self, _bus, _msg):
+        if self.verbose:
+            print("gst EOS")
+        self.set_status("stream ended")
+
+    def shutdown(self):
+        self._teardown()
+
+
+def cmd_run(args) -> int:
+    mirror = Mirror(
+        args.projector,
+        poll_ms=int(args.interval * 1000),
+        zoom=args.zoom,
+        pan_mode=args.pan_mode,
+        deadzone=args.deadzone,
+        verbose=args.verbose,
+    )
+
+    app = Gtk.Application(application_id="dev.kieran.screenmirror",
+                          flags=Gio.ApplicationFlags.NON_UNIQUE)
+    app.connect("activate", mirror.build_window)
+
+    def on_sigint(*_):
+        mirror.shutdown()
+        app.quit()
+    signal.signal(signal.SIGINT, on_sigint)
+    signal.signal(signal.SIGTERM, on_sigint)
+
+    rc = app.run([])
+    mirror.shutdown()
+    return rc
+
+
+def cmd_info(args) -> int:
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    dc = Gio.DBusProxy.new_sync(
+        bus, Gio.DBusProxyFlags.NONE, None,
+        DC_BUS, DC_PATH, DC_IFACE, None,
+    )
+    lms, layout_mode = fetch_display_state(dc)
+    cx, cy = get_cursor_xy()
+    print(f"layout-mode: {layout_mode}")
+    print("logical monitors:")
+    for lm in lms:
+        flag = " (primary)" if lm["primary"] else ""
+        on = " <- cursor" if (lm["x"] <= cx < lm["x"] + lm["w"]
+                              and lm["y"] <= cy < lm["y"] + lm["h"]) else ""
+        print(f"  {lm['connector']:10s} ({lm['x']:5d},{lm['y']:5d}) "
+              f"{lm['w']}x{lm['h']}{flag}{on}")
+    print(f"cursor: ({cx},{cy})")
+
+    d = Gdk.Display.get_default()
+    ms = d.get_monitors()
+    print("gdk monitors:")
+    for i in range(ms.get_n_items()):
+        m = ms.get_item(i)
+        print(f"  {m.get_connector()}  {m.get_geometry().width}x{m.get_geometry().height}")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--projector", default="HDMI-1", help="connector to display on (default: HDMI-1)")
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("run", help="start mirroring (default)")
+    sp.add_argument("--interval", type=float, default=0.2,
+                    help="safety-net poll interval seconds (default 0.2 = 5Hz). "
+                         "Primary cursor updates come from the in-shell pointer hook "
+                         "at ~60Hz.")
+    sp.add_argument("--zoom", type=float, default=1.5,
+                    help="zoom multiplier on top of 'fill projector' "
+                         "(1.0 = fill; <1 letterboxes; >1 zooms in with more pan room). "
+                         "Default 1.5.")
+    sp.add_argument("--pan-mode", choices=["edge", "center"], default="center",
+                    help="center: cursor always at projector midpoint (default). "
+                         "edge: cursor moves freely until it nears the projector "
+                         "edge, then the view pans.")
+    sp.add_argument("--deadzone", type=float, default=0.5,
+                    help="edge-mode deadzone as fraction of projector size — "
+                         "0.5 = middle half free, 0.0 = always pan, 0.9 = mostly free")
+    sp.add_argument("--verbose", "-v", action="store_true")
+    sp.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("info", help="print monitor state and exit")
+    sp.set_defaults(func=cmd_info)
+
+    args = p.parse_args()
+    if args.cmd is None:
+        args.interval = 0.2
+        args.zoom = 1.5
+        args.pan_mode = "center"
+        args.deadzone = 0.5
+        args.verbose = False
+        return cmd_run(args)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

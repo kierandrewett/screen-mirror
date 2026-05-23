@@ -1,0 +1,4 @@
+# Large build inputs / outputs — checked into the upstream gnome-shell
+# and mutter forks separately. The patches themselves are tracked.
+*.src.rpm
+*.tar.xz

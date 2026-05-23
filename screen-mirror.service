@@ -1,0 +1,18 @@
+[Unit]
+Description=Cursor-following screen mirror to projector
+Documentation=https://github.com/kierandrewett/gnome-shell
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/kieran/dev/screens/screen-mirror run
+Restart=always
+RestartSec=5
+# Restart=always will hot-loop while HDMI-1 is unplugged; the 5s gap
+# keeps it from spinning. The mirror exits quickly when the projector
+# can't be found, so this is the throttle.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target
