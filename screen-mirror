@@ -80,7 +80,10 @@ class PanningPaintable(GObject.GObject, Gdk.Paintable):
         # Fullscreen mode flag — paints a backdrop and suppresses
         # every chrome overlay (focus chip, clock, key overlay, banner).
         self._fs_mode = False
-        self._fs_bg = (0.0, 0.0, 0.0)  # RGB tuple, 0–1
+        # Backdrop colour painted under the source. Visible wherever
+        # the source doesn't cover the projector — overspill dead zone
+        # in normal mode, letterbox bars in fullscreen mode.
+        self._bg = (1.0, 1.0, 1.0)  # white by day, gray at night
         # Caps Lock indicator — rendered as its own chip at the left
         # of the key overlay row whenever Caps is on.
         self._caps_on = False
@@ -181,11 +184,11 @@ class PanningPaintable(GObject.GObject, Gdk.Paintable):
         self._lens_zoom = z
         self.invalidate_contents()
 
-    def set_fs_bg(self, r: float, g: float, b: float):
+    def set_bg(self, r: float, g: float, b: float):
         c = (float(r), float(g), float(b))
-        if c == self._fs_bg:
+        if c == self._bg:
             return
-        self._fs_bg = c
+        self._bg = c
         self.invalidate_contents()
 
     def set_caps_on(self, on: bool):
@@ -209,13 +212,12 @@ class PanningPaintable(GObject.GObject, Gdk.Paintable):
         sx = width / self._vw
         sy = height / self._vh
 
-        if self._fs_mode:
-            # Backdrop so letterbox/pillarbox bars don't appear as the
-            # window's default white.
-            bg = snapshot.append_cairo(Graphene.Rect().init(0, 0, width, height))
-            bg.set_source_rgb(*self._fs_bg)
-            bg.rectangle(0, 0, width, height)
-            bg.fill()
+        # Backdrop painted in both modes so the overspill dead-zone and
+        # the fullscreen letterbox bars get the same colour.
+        bg = snapshot.append_cairo(Graphene.Rect().init(0, 0, width, height))
+        bg.set_source_rgb(*self._bg)
+        bg.rectangle(0, 0, width, height)
+        bg.fill()
 
         # Source render (translated by the pan offset).
         snapshot.save()
@@ -1037,13 +1039,14 @@ class Mirror:
             from datetime import datetime
             now = datetime.now()
             self._wrapped_paintable.set_clock_text(now.strftime("%H:%M"))
-            # After 20:00 (8 pm), tint the fullscreen letterbox bars
-            # gray instead of pitch black — easier on the eyes in a
-            # darkened room.
-            if now.hour >= 20:
-                self._wrapped_paintable.set_fs_bg(0.18, 0.18, 0.18)
+            # 20:00 → 07:00 (evening through the night into morning)
+            # tints the dead-zone / letterbox bars gray; the rest of
+            # the day they're white. Without the `< 7` branch the bg
+            # flipped back at midnight.
+            if now.hour >= 20 or now.hour < 7:
+                self._wrapped_paintable.set_bg(0.2, 0.2, 0.2)
             else:
-                self._wrapped_paintable.set_fs_bg(0.0, 0.0, 0.0)
+                self._wrapped_paintable.set_bg(1.0, 1.0, 1.0)
         return True  # keep ticking
 
     def _on_focus_signal(self, _conn, _sender, _path, _iface, _signal, params):
@@ -1155,8 +1158,7 @@ class Mirror:
             self._wrapped_paintable.set_fs_mode(True)
             self._wrapped_paintable.set_lens_zoom(3.0)
             self._fs_active = True
-            if self.verbose:
-                print(f"fullscreen-fit: {si['w']}x{si['h']} -> {rw}x{rh} on {self.proj_w}x{self.proj_h}")
+            print(f"fullscreen-fit ON: {si['w']}x{si['h']} -> {rw}x{rh} on {self.proj_w}x{self.proj_h}", file=sys.stderr)
         elif not want and self._fs_active:
             # Leave fit mode: restore pan dims and let next cursor signal
             # repopulate offset + lens.
@@ -1167,8 +1169,7 @@ class Mirror:
             self._wrapped_paintable.set_fs_mode(False)
             self._wrapped_paintable.set_lens_zoom(1.5)
             self._fs_active = False
-            if self.verbose:
-                print("fullscreen-fit: off")
+            print("fullscreen-fit OFF", file=sys.stderr)
 
     def _process_cursor(self, cx: int, cy: int):
         """React to a cursor position update: bounce off projector,
