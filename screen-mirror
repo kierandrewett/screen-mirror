@@ -14,6 +14,8 @@ import signal
 import sys
 from typing import Optional
 
+import numpy as np
+
 import gi
 gi.require_version("GLib", "2.0")
 gi.require_version("Gio", "2.0")
@@ -563,6 +565,21 @@ INSTALL_HOOK_JS = r"""
         GLib.source_remove(global._kdrFsTimerId);
         delete global._kdrFsTimerId;
     }
+    // Direct-scanout suppressor: Mutter bypasses its compositor and
+    // scans the fullscreen video buffer straight to the display
+    // hardware once the cursor goes idle — at which point our
+    // screencast stream stops getting new frames. Calling
+    // meta_compositor_disable_unredirect() bumps a counter that gates
+    // find_scanout_candidate() in src/compositor/meta-compositor-
+    // view-native.c, so direct scanout stays off as long as we keep
+    // it incremented. We guard with _kdrUnredirectInhibited so each
+    // re-install doesn't stack increments.
+    if (!global._kdrUnredirectInhibited) {
+        try {
+            global.compositor.disable_unredirect();
+            global._kdrUnredirectInhibited = true;
+        } catch (e) {}
+    }
     const conn = Gio.DBus.session;
     global._kdrLastX = -99999;
     global._kdrLastY = -99999;
@@ -682,6 +699,11 @@ UNINSTALL_HOOK_JS = r"""
         try { global._kdrTitleHandlerWin.disconnect(global._kdrTitleHandler); } catch (e) {}
         delete global._kdrTitleHandler;
         delete global._kdrTitleHandlerWin;
+    }
+    if (global._kdrUnredirectInhibited) {
+        try { global.compositor.enable_unredirect(); } catch (e) {}
+        delete global._kdrUnredirectInhibited;
+        removed.push('unredirect-restored');
     }
     return removed.join(',') || 'not installed';
 })()
@@ -834,6 +856,10 @@ class Mirror:
         # Seeded from a one-shot Eval at startup so we have a position
         # before the first pointer motion arrives.
         self._cursor_xy: Optional[tuple] = None
+        # Wrapped paintable handle — populated when a pipeline is built.
+        # Initialised here so the cursor signal handler doesn't crash
+        # when it arrives before the first capture starts.
+        self._wrapped_paintable = None
         # Lens auto-hide: timer id and idle threshold. The cursor view
         # passed to the paintable is set to None when no movement for
         # `lens_idle_ms` so the magnifier disappears.
@@ -844,6 +870,20 @@ class Mirror:
         # fullscreen, we swap to aspect-fit "as is" mode.
         self._fs_by_xy: dict = {}
         self._fs_active: bool = False
+        # Black-bar auto-crop in fullscreen mode: detector appsink set
+        # up in _build_pipeline, periodically sampled to find the
+        # rectangle of non-black pixels and refit it to the projector.
+        self._detector = None
+        # Last applied crop as (left, top, right, bottom) source
+        # fractions (0–1). (0,0,1,1) means no crop.
+        self._content_crop = (0.0, 0.0, 1.0, 1.0)
+        # Debounce: a candidate crop must hold steady for this long
+        # before we apply it, so transient on-screen black (dark
+        # scenes, transitions) doesn't trigger crops.
+        self._crop_debounce_s = 5.0
+        self._crop_candidate: Optional[tuple] = None
+        self._crop_candidate_since = 0.0
+        GLib.timeout_add(1000, self._bar_detect_tick)
         # Source-switch banner animation: tick_id + fade params.
         self._banner_tick_id = 0
         self._banner_t0 = 0.0
@@ -1134,6 +1174,111 @@ class Mirror:
         self._wrapped_paintable.set_banner(self._banner_text_str, alpha)
         return True
 
+    def _apply_fs_fit(self):
+        """Compute render_size + offset so the current crop sub-rect of
+        the source is aspect-fit + centred on the projector."""
+        if self._wrapped_paintable is None or self.src_info is None:
+            return
+        lf, tf, rf, bf = self._content_crop
+        si = self.src_info
+        src_w, src_h = si["w"], si["h"]
+        sx = lf * src_w
+        sy = tf * src_h
+        sw = max(1.0, (rf - lf) * src_w)
+        sh = max(1.0, (bf - tf) * src_h)
+        src_aspect = sw / sh
+        proj_aspect = self.proj_w / self.proj_h
+        if src_aspect > proj_aspect:
+            fit_w = self.proj_w
+            fit_h = self.proj_w / src_aspect
+        else:
+            fit_h = self.proj_h
+            fit_w = self.proj_h * src_aspect
+        scale = fit_w / sw
+        render_w = max(1, int(round(src_w * scale)))
+        render_h = max(1, int(round(src_h * scale)))
+        dx = (self.proj_w - fit_w) / 2 - sx * scale
+        dy = (self.proj_h - fit_h) / 2 - sy * scale
+        self._wrapped_paintable.set_render_size(render_w, render_h)
+        self._wrapped_paintable.set_offset(dx, dy)
+
+    def _bar_detect_tick(self) -> bool:
+        # Only run while a fs source is active. Cheap when not, since
+        # the appsink branch keeps draining frames in its leaky queue.
+        if not self._fs_active or self._detector is None or self.src_info is None:
+            return True
+        sample = self._detector.emit("try-pull-sample", 0)
+        if sample is None:
+            return True
+        rect = self._detect_content_rect(sample)
+        if rect is None:
+            return True
+        # Debounce: ignore detections that haven't held steady for at
+        # least crop_debounce_s. Without this, dark scenes in a normal
+        # 16:9 video can briefly look like even darker bars and crop
+        # the picture mid-playback.
+        import time
+        now = time.monotonic()
+        if self._crop_candidate is None or not self._close(rect, self._crop_candidate):
+            # New candidate — reset its observed-since timestamp.
+            self._crop_candidate = rect
+            self._crop_candidate_since = now
+            return True
+        # Candidate matched what we've seen — has it been stable long enough?
+        if now - self._crop_candidate_since < self._crop_debounce_s:
+            return True
+        # Already what's applied? Skip.
+        if self._close(rect, self._content_crop):
+            return True
+        self._content_crop = rect
+        if self.verbose:
+            print(f"auto-crop applied: {rect}", file=sys.stderr)
+        self._apply_fs_fit()
+        return True
+
+    @staticmethod
+    def _close(a: tuple, b: tuple, tol: float = 0.02) -> bool:
+        return (abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
+                and abs(a[2] - b[2]) < tol and abs(a[3] - b[3]) < tol)
+
+    @staticmethod
+    def _detect_content_rect(sample) -> Optional[tuple]:
+        """Scan a captured frame for the bounding box of non-black
+        pixels. Returns (left, top, right, bottom) as 0–1 fractions of
+        frame width/height, or None if the frame is fully black or
+        too small to be a real video region."""
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        s = caps.get_structure(0)
+        ok_w, w = s.get_int("width")
+        ok_h, h = s.get_int("height")
+        if not ok_w or not ok_h:
+            return None
+        success, info = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return None
+        try:
+            data = bytes(info.data)
+            if len(data) < w * h * 4:
+                return None
+            arr = np.frombuffer(data, dtype=np.uint8, count=w * h * 4).reshape((h, w, 4))
+            # max of B,G,R per pixel — alpha ignored.
+            bright = arr[:, :, :3].max(axis=2)
+            row_active = (bright > 18).any(axis=1)
+            col_active = (bright > 18).any(axis=0)
+            if not row_active.any() or not col_active.any():
+                return None
+            top = int(np.argmax(row_active))
+            bot = h - int(np.argmax(row_active[::-1]))
+            lef = int(np.argmax(col_active))
+            rig = w - int(np.argmax(col_active[::-1]))
+            # Reject implausibly tiny rects (<20% of frame in either axis).
+            if (rig - lef) < w * 0.2 or (bot - top) < h * 0.2:
+                return None
+            return (lef / w, top / h, rig / w, bot / h)
+        finally:
+            buf.unmap(info)
+
     def _sync_fs_mode(self):
         """Apply or clear fullscreen-fit mode based on current source's
         fullscreen state. Idempotent."""
@@ -1141,24 +1286,18 @@ class Mirror:
             return
         want = self._source_is_fullscreen()
         if want and not self._fs_active:
-            # Enter fit mode: render source aspect-fit, centered, no lens.
-            si = self.src_info
-            src_aspect = si["w"] / si["h"]
-            proj_aspect = self.proj_w / self.proj_h
-            if src_aspect > proj_aspect:
-                rw = self.proj_w
-                rh = int(round(self.proj_w / src_aspect))
-            else:
-                rh = self.proj_h
-                rw = int(round(self.proj_h * src_aspect))
-            self._wrapped_paintable.set_render_size(rw, rh)
-            self._wrapped_paintable.set_offset(
-                (self.proj_w - rw) / 2, (self.proj_h - rh) / 2,
-            )
+            # Enter fit mode. Initial fit assumes no crop; the detector
+            # tick refines once a candidate has been stable for the
+            # debounce window.
+            self._content_crop = (0.0, 0.0, 1.0, 1.0)
+            self._crop_candidate = None
+            self._crop_candidate_since = 0.0
+            self._apply_fs_fit()
             self._wrapped_paintable.set_fs_mode(True)
             self._wrapped_paintable.set_lens_zoom(3.0)
             self._fs_active = True
-            print(f"fullscreen-fit ON: {si['w']}x{si['h']} -> {rw}x{rh} on {self.proj_w}x{self.proj_h}", file=sys.stderr)
+            print(f"fullscreen-fit ON: {self.src_info['w']}x{self.src_info['h']} "
+                  f"on {self.proj_w}x{self.proj_h}", file=sys.stderr)
         elif not want and self._fs_active:
             # Leave fit mode: restore pan dims and let next cursor signal
             # repopulate offset + lens.
@@ -1731,21 +1870,23 @@ class Mirror:
         )
         self.src_info = src  # may be None if monitor vanished
 
-        # No crop in the pipeline — the full source frame becomes a
-        # GdkPaintable, and panning happens by translating the Picture
-        # widget. A leaky single-buffer queue in front of the sink drops
-        # stale frames if rendering falls behind, and sync=false lets the
-        # sink render as soon as frames arrive.
+        # Pipeline: tee the BGRx stream — one branch goes to the
+        # display sink, the other to an appsink we periodically poll
+        # for black-bar detection while in fullscreen mode.
         desc = (
             f"pipewiresrc path={node_id} do-timestamp=true "
             f"! videoconvert ! video/x-raw,format=BGRx "
-            f"! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
-            f"! gtk4paintablesink name=sink sync=false"
+            f"! tee name=t "
+            f"t. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
+            f"! gtk4paintablesink name=sink sync=false "
+            f"t. ! queue max-size-buffers=1 leaky=downstream "
+            f"! appsink name=detector emit-signals=false max-buffers=1 drop=true sync=false"
         )
         if self.verbose:
             print(f"pipeline: {desc}")
         self.pipeline = Gst.parse_launch(desc)
         sink = self.pipeline.get_by_name("sink")
+        self._detector = self.pipeline.get_by_name("detector")
         paintable = sink.props.paintable
         self.picture.set_paintable(paintable)
 
