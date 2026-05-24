@@ -705,6 +705,13 @@ UNINSTALL_HOOK_JS = r"""
         delete global._kdrUnredirectInhibited;
         removed.push('unredirect-restored');
     }
+    if (global._kdrBarriers) {
+        for (const b of global._kdrBarriers) {
+            try { b.destroy(); } catch (e) {}
+        }
+        delete global._kdrBarriers;
+        removed.push('barriers');
+    }
     return removed.join(',') || 'not installed';
 })()
 """
@@ -957,10 +964,73 @@ class Mirror:
         except Exception as e:
             if self.verbose:
                 print(f"display-state refresh failed: {e}", file=sys.stderr)
+        # Re-install pointer barriers since monitor geometry may have
+        # moved.
+        try:
+            self._install_pointer_barriers()
+        except Exception as e:
+            if self.verbose:
+                print(f"barrier refresh failed: {e}", file=sys.stderr)
 
     def _on_dc_signal(self, _proxy, _sender, signal: str, _params):
         if signal == "MonitorsChanged":
             self._refresh_display_cache()
+
+    def _install_pointer_barriers(self):
+        """Drop Mutter pointer barriers around the projector monitor so
+        the cursor physically can't cross into its area. This is a
+        compositor-level hard block, no polling needed."""
+        proj = next(
+            (lm for lm in self._lms_cache if lm["connector"] == self.projector),
+            None,
+        )
+        if proj is None:
+            return
+        x = proj["x"]
+        y = proj["y"]
+        x2 = x + proj["w"]
+        y2 = y + proj["h"]
+        js = (
+            "(() => {"
+            "  if (global._kdrBarriers) {"
+            "    for (const b of global._kdrBarriers) {"
+            "      try { b.destroy(); } catch (e) {}"
+            "    }"
+            "  }"
+            "  global._kdrBarriers = [];"
+            "  const Meta = imports.gi.Meta;"
+            "  const D = Meta.BarrierDirection;"
+            "  const mk = (x1, y1, x2, y2, directions) => global._kdrBarriers.push("
+            "    new Meta.Barrier({"
+            "      backend: global.backend,"
+            "      x1, y1, x2, y2, directions,"
+            "    })"
+            "  );"
+            # MetaBarrierDirection.POSITIVE_X blocks events arriving
+            # from the +X side of the line (i.e. leftward exits);
+            # NEGATIVE_X blocks events from -X (rightward entries).
+            # So to keep cursor OUT of the monitor's rect, use the
+            # opposite direction from the "obvious" one.
+            f"  mk({x}, {y}, {x}, {y2}, D.NEGATIVE_X);"   # left edge — block entries from outside (left)
+            f"  mk({x2}, {y}, {x2}, {y2}, D.POSITIVE_X);"  # right edge — block entries from outside (right)
+            f"  mk({x}, {y}, {x2}, {y}, D.NEGATIVE_Y);"    # top edge — block entries from outside (above)
+            f"  mk({x}, {y2}, {x2}, {y2}, D.POSITIVE_Y);"  # bottom edge — block entries from outside (below)
+            "  return global._kdrBarriers.length + ' barriers';"
+            "})()"
+        )
+        try:
+            res = _shell_proxy().call_sync(
+                "Eval", GLib.Variant("(s)", (js,)),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+            ok, payload = res.unpack()
+            if self.verbose and ok:
+                print(f"pointer barriers: {payload} around {self.projector} "
+                      f"({x},{y})-({x2},{y2})")
+            elif not ok:
+                print(f"barrier install failed: {payload}", file=sys.stderr)
+        except Exception as e:
+            print(f"barrier install Eval failed: {e}", file=sys.stderr)
 
     def _install_shell_hook(self):
         # Subscribe to the custom signal first so we don't miss anything
