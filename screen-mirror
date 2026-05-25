@@ -82,10 +82,13 @@ class PanningPaintable(GObject.GObject, Gdk.Paintable):
         # Fullscreen mode flag — paints a backdrop and suppresses
         # every chrome overlay (focus chip, clock, key overlay, banner).
         self._fs_mode = False
-        # Backdrop colour painted under the source. Visible wherever
-        # the source doesn't cover the projector — overspill dead zone
-        # in normal mode, letterbox bars in fullscreen mode.
-        self._bg = (1.0, 1.0, 1.0)  # white by day, gray at night
+        # Backdrop colour for normal mode (overspill dead zone).
+        # Time-based: white by day, gray at night.
+        self._bg = (1.0, 1.0, 1.0)
+        # Backdrop colour for fullscreen mode (letterbox bars around
+        # the source). Always black so videos sit on a true-black
+        # cinema-style backdrop.
+        self._fs_bg = (0.0, 0.0, 0.0)
         # Caps Lock indicator — rendered as its own chip at the left
         # of the key overlay row whenever Caps is on.
         self._caps_on = False
@@ -115,6 +118,17 @@ class PanningPaintable(GObject.GObject, Gdk.Paintable):
             return
         self._rw = rw
         self._rh = rh
+        self.invalidate_contents()
+
+    def set_view_size(self, vw: int, vh: int):
+        vw = max(1, int(vw))
+        vh = max(1, int(vh))
+        if vw == self._vw and vh == self._vh:
+            return
+        self._vw = vw
+        self._vh = vh
+        # Picture watches intrinsic size — re-measure.
+        self.invalidate_size()
         self.invalidate_contents()
 
     def set_cursor_view(self, x: Optional[float], y: Optional[float]):
@@ -214,10 +228,11 @@ class PanningPaintable(GObject.GObject, Gdk.Paintable):
         sx = width / self._vw
         sy = height / self._vh
 
-        # Backdrop painted in both modes so the overspill dead-zone and
-        # the fullscreen letterbox bars get the same colour.
+        # Backdrop. fs mode uses its own (black) colour so videos sit
+        # on a true-black backdrop regardless of time-of-day tint.
+        bg_color = self._fs_bg if self._fs_mode else self._bg
         bg = snapshot.append_cairo(Graphene.Rect().init(0, 0, width, height))
-        bg.set_source_rgb(*self._bg)
+        bg.set_source_rgb(*bg_color)
         bg.rectangle(0, 0, width, height)
         bg.fill()
 
@@ -233,8 +248,10 @@ class PanningPaintable(GObject.GObject, Gdk.Paintable):
             self._draw_lens(snapshot, sx, sy)
 
         if self._fs_mode:
-            # Skip the rest of the chrome in fullscreen — projector
-            # stays a clean mirror except for the magnifier.
+            # Banner draws in fs too so hints (e.g. blackout shortcut)
+            # surface when fullscreen starts. All other chrome is
+            # suppressed for a clean projector.
+            self._draw_banner(snapshot, sx, sy)
             return
 
         self._draw_focus_chip(snapshot, sx, sy)
@@ -565,6 +582,19 @@ INSTALL_HOOK_JS = r"""
         GLib.source_remove(global._kdrFsTimerId);
         delete global._kdrFsTimerId;
     }
+    // Tear down any stale cinema-mode overlay + modal grab from a
+    // previous mirror run (service restart, crash, etc.). Without
+    // this a phantom black screen can persist after restart.
+    if (global._kdrBlackouts) {
+        for (const a of global._kdrBlackouts) {
+            if (a._grab) {
+                try { Main.popModal(a._grab); } catch (e) {}
+                a._grab = null;
+            }
+            try { a.destroy(); } catch (e) {}
+        }
+        delete global._kdrBlackouts;
+    }
     // Direct-scanout suppressor: Mutter bypasses its compositor and
     // scans the fullscreen video buffer straight to the display
     // hardware once the cursor goes idle — at which point our
@@ -893,6 +923,19 @@ class Mirror:
         GLib.timeout_add(1000, self._bar_detect_tick)
         # Source-switch banner animation: tick_id + fade params.
         self._banner_tick_id = 0
+        # Alt+H blackout toggle — grabs the accelerator at startup,
+        # only acts on it while fs mode is active.
+        self._blackout_action_id = 0
+        self._blackout_on = False
+        self._grab_blackout_accelerator()
+        # Click-to-dismiss escape from the in-shell overlay.
+        try:
+            self.bus.signal_subscribe(
+                None, HOOK_IFACE, "BlackoutDismissed", HOOK_PATH, None,
+                Gio.DBusSignalFlags.NONE, self._on_blackout_dismissed,
+            )
+        except Exception as e:
+            print(f"BlackoutDismissed subscribe failed: {e}", file=sys.stderr)
         self._banner_t0 = 0.0
         self._banner_hold_ms = 1200
         self._banner_fade_ms = 2200
@@ -971,10 +1014,270 @@ class Mirror:
         except Exception as e:
             if self.verbose:
                 print(f"barrier refresh failed: {e}", file=sys.stderr)
+        # Re-fullscreen the projector window on the (possibly moved)
+        # projector and resize the paintable's view to match.
+        self._refresh_window_geometry()
+
+    def _refresh_window_geometry(self):
+        if getattr(self, "window", None) is None:
+            return
+        mon = self.find_projector_monitor()
+        if mon is None:
+            return
+        geom = mon.get_geometry()
+        if geom.width == self.proj_w and geom.height == self.proj_h:
+            # Even if dims are the same, the monitor might have moved
+            # to a different x/y on the compositor layout — re-applying
+            # fullscreen_on_monitor lands the window on the right one.
+            self.window.fullscreen_on_monitor(mon)
+            return
+        self.proj_w = geom.width
+        self.proj_h = geom.height
+        self.window.set_default_size(self.proj_w, self.proj_h)
+        self.window.fullscreen_on_monitor(mon)
+        if self._wrapped_paintable is not None:
+            self._wrapped_paintable.set_view_size(self.proj_w, self.proj_h)
+            size = self._compute_picture_size()
+            if size is not None:
+                self.disp_w, self.disp_h = size
+                self._wrapped_paintable.set_render_size(self.disp_w, self.disp_h)
+            if self._fs_active:
+                self._apply_fs_fit()
+        if self.verbose:
+            print(f"projector resized -> {self.proj_w}x{self.proj_h}")
 
     def _on_dc_signal(self, _proxy, _sender, signal: str, _params):
         if signal == "MonitorsChanged":
             self._refresh_display_cache()
+
+    def _grab_blackout_accelerator(self):
+        # <Alt>h alone is already bound system-wide (Files toggles
+        # hidden, etc.) and GrabAccelerator refuses to take it.
+        # Ctrl+Alt+H is an unused triad that's close enough to type.
+        accel = "<Ctrl><Alt>h"
+        # modeFlags = Shell.ActionMode.ALL (0xFFFFFFFF) so the
+        # accelerator fires in normal use AND while a fullscreen app
+        # has the input focus. With modeFlags=0 the grab is held but
+        # never delivered; with only NORMAL it doesn't fire while a
+        # fullscreen Wayland client is focused.
+        mode_all = 0xFFFFFFFF
+        try:
+            res = _shell_proxy().call_sync(
+                "GrabAccelerator",
+                GLib.Variant("(suu)", (accel, mode_all, 0)),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+            action = res.unpack()[0]
+            if action == 0:
+                print(f"{accel} grab failed (already taken)", file=sys.stderr)
+                return
+            self._blackout_action_id = int(action)
+            if self.verbose:
+                print(f"{accel} grabbed (action={action})")
+            self.bus.signal_subscribe(
+                "org.gnome.Shell", "org.gnome.Shell",
+                "AcceleratorActivated", "/org/gnome/Shell", None,
+                Gio.DBusSignalFlags.NONE, self._on_accelerator,
+            )
+        except Exception as e:
+            print(f"GrabAccelerator failed: {e}", file=sys.stderr)
+
+    def _on_accelerator(self, _conn, _sender, _path, _iface, _signal, params):
+        try:
+            action, _parameters = params.unpack()
+            if action != self._blackout_action_id:
+                return
+            if not self._fs_active:
+                return
+            self._toggle_blackout()
+        except Exception as e:
+            print(f"accelerator handler error: {e}", file=sys.stderr)
+
+    def _toggle_blackout(self):
+        self._set_blackout(not self._blackout_on)
+
+    def _on_blackout_dismissed(self, *_args):
+        # Shell-side dismiss already destroyed the overlay + popped the
+        # modal grab. We still have to swap capture back from
+        # RecordWindow to RecordMonitor so the projector returns to
+        # full monitor mirroring (and the cursor reappears in the lens).
+        if not self._blackout_on:
+            return
+        self._blackout_on = False
+        self._switch_capture(window_id=None)
+        self._start_banner("cinema mode off")
+
+    def _set_blackout(self, on: bool):
+        if on == self._blackout_on:
+            return
+        src = next(
+            (lm for lm in self._lms_cache if lm["connector"] == self.current_source),
+            None,
+        )
+        if src is None:
+            return
+        if on:
+            window_id = self._fullscreen_window_id_at(src["x"], src["y"])
+            if window_id is None:
+                self._start_banner("cinema mode needs a fullscreen window")
+                return
+            # Switch capture to the source's fullscreen window so the
+            # cinema overlay we layer on the source monitor doesn't
+            # appear on the projector. Cinema mode's modal grab also
+            # blocks any input from reaching the source app, so popups
+            # (which RecordWindow doesn't capture) can't be opened in
+            # the first place.
+            self._switch_capture(window_id=window_id)
+            self._set_source_overlay(src, on=True)
+            # Hide the lens while cinema is on — it sits on top of the
+            # projector window and is distracting when the source is
+            # locked black anyway.
+            if self._wrapped_paintable is not None:
+                self._wrapped_paintable.set_cursor_view(None, None)
+            if self._lens_hide_timer:
+                GLib.source_remove(self._lens_hide_timer)
+                self._lens_hide_timer = 0
+        else:
+            self._set_source_overlay(src, on=False)
+            self._switch_capture(window_id=None)
+            self._start_banner("cinema mode off")
+        self._blackout_on = on
+        if self.verbose:
+            print(f"cinema {'ON' if on else 'OFF'}")
+
+    def _switch_capture(self, window_id: Optional[int]):
+        # Rebuild the pipeline so the new session feeds the same
+        # paintable seamlessly.
+        connector = self.current_source
+        if connector is None:
+            return
+        self.pending_source = connector
+        self._teardown()
+        try:
+            self._start_capture(connector, window_id=window_id)
+        except GLib.Error as e:
+            print(f"capture switch failed: {e.message}", file=sys.stderr)
+            self.pending_source = None
+
+    def _fullscreen_window_id_at(self, mx: int, my: int) -> Optional[int]:
+        js = (
+            "(() => {"
+            "  const ws = global.display.list_all_windows();"
+            f"  const mx = {mx}, my = {my};"
+            "  for (const w of ws) {"
+            "    if (!w.is_fullscreen()) continue;"
+            "    const r = w.get_frame_rect();"
+            "    if (r.x <= mx && mx < r.x + r.width &&"
+            "        r.y <= my && my < r.y + r.height) {"
+            "      return String(w.get_id());"
+            "    }"
+            "  }"
+            "  return '';"
+            "})()"
+        )
+        try:
+            res = _shell_proxy().call_sync(
+                "Eval", GLib.Variant("(s)", (js,)),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+            ok, val = res.unpack()
+            if not ok or not val:
+                return None
+            val = json.loads(val) if val.startswith('"') else val
+            if val.isdigit():
+                return int(val)
+        except Exception:
+            return None
+        return None
+
+    def _set_source_overlay(self, src: dict, on: bool):
+        if on:
+            # Cinema mode: full-monitor overlay with a Main.pushModal
+            # grab so every input event funnels here. Any key or click
+            # dismisses. The source app (browser, etc.) receives no
+            # input while cinema is on — so popups can't open, hotkeys
+            # don't fire, nothing surprising happens behind the black.
+            js = (
+                "(() => {"
+                "  if (global._kdrBlackouts) {"
+                "    for (const a of global._kdrBlackouts) {"
+                "      try { a.destroy(); } catch (e) {}"
+                "    }"
+                "  }"
+                "  global._kdrBlackouts = [];"
+                "  const St = imports.gi.St;"
+                "  const Clutter = imports.gi.Clutter;"
+                "  /* Main is already a global in Shell.Eval scope. */"
+                "  const overlay = new St.Bin({"
+                f"    x: {src['x']}, y: {src['y']},"
+                f"    width: {src['w']}, height: {src['h']},"
+                "    reactive: true,"
+                "    can_focus: true,"
+                "    track_hover: false,"
+                "    style: 'background-color: black;',"
+                "  });"
+                "  const label = new St.Label({"
+                "    text: 'cinema mode — press anything to exit',"
+                "    style: 'color: rgba(255,255,255,0.4); "
+                "            font-size: 32px; "
+                "            font-weight: bold;',"
+                "  });"
+                "  overlay.set_child(label);"
+                "  global.stage.add_child(overlay);"
+                "  global._kdrBlackouts.push(overlay);"
+                "  const dismiss = () => {"
+                "    if (overlay._grab) {"
+                "      try { Main.popModal(overlay._grab); } catch (e) {}"
+                "      overlay._grab = null;"
+                "    }"
+                "    try { overlay.destroy(); } catch (e) {}"
+                "    global._kdrBlackouts = (global._kdrBlackouts || [])"
+                "      .filter(a => a !== overlay);"
+                "    try {"
+                f"      Gio.DBus.session.emit_signal(null, '{HOOK_PATH}',"
+                f"        '{HOOK_IFACE}', 'BlackoutDismissed', null);"
+                "    } catch (e) {}"
+                "    return Clutter.EVENT_STOP;"
+                "  };"
+                "  overlay.connect('captured-event', (_a, ev) => {"
+                "    const t = ev.type();"
+                "    if (t === Clutter.EventType.KEY_PRESS"
+                "        || t === Clutter.EventType.BUTTON_PRESS"
+                "        || t === Clutter.EventType.TOUCH_BEGIN) {"
+                "      return dismiss();"
+                "    }"
+                "    return Clutter.EVENT_PROPAGATE;"
+                "  });"
+                "  try {"
+                "    overlay._grab = Main.pushModal(overlay,"
+                "      { actionMode: Shell.ActionMode.NORMAL });"
+                "  } catch (e) {}"
+                "  return 'on';"
+                "})()"
+            )
+        else:
+            js = (
+                "(() => {"
+                "  if (!global._kdrBlackouts) return 'off';"
+                "  /* Main is already a global in Shell.Eval scope. */"
+                "  for (const a of global._kdrBlackouts) {"
+                "    if (a._grab) {"
+                "      try { Main.popModal(a._grab); } catch (e) {}"
+                "      a._grab = null;"
+                "    }"
+                "    try { a.destroy(); } catch (e) {}"
+                "  }"
+                "  delete global._kdrBlackouts;"
+                "  return 'off';"
+                "})()"
+            )
+        try:
+            _shell_proxy().call_sync(
+                "Eval", GLib.Variant("(s)", (js,)),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+        except Exception as e:
+            print(f"source overlay call failed: {e}", file=sys.stderr)
 
     def _install_pointer_barriers(self):
         """Drop Mutter pointer barriers around the projector monitor so
@@ -1072,7 +1375,7 @@ class Mirror:
                     # Anchor stays attached to the cursor regardless of
                     # lens state so the key overlay keeps following.
                     self._wrapped_paintable.set_anchor_view(view[0], view[1])
-            if moved and self._wrapped_paintable is not None:
+            if moved and self._wrapped_paintable is not None and not self._blackout_on:
                 view = None
                 if not self._fs_active:
                     view = getattr(self, "_last_cursor_view", None)
@@ -1366,6 +1669,8 @@ class Mirror:
             self._wrapped_paintable.set_fs_mode(True)
             self._wrapped_paintable.set_lens_zoom(3.0)
             self._fs_active = True
+            # Hint the cinema-mode shortcut so it's discoverable.
+            self._start_banner("Ctrl+Alt+H — cinema mode (press anything to exit)")
             print(f"fullscreen-fit ON: {self.src_info['w']}x{self.src_info['h']} "
                   f"on {self.proj_w}x{self.proj_h}", file=sys.stderr)
         elif not want and self._fs_active:
@@ -1378,6 +1683,9 @@ class Mirror:
             self._wrapped_paintable.set_fs_mode(False)
             self._wrapped_paintable.set_lens_zoom(1.5)
             self._fs_active = False
+            # Also drop any blackout the user toggled on while in fs.
+            if self._blackout_on:
+                self._set_blackout(False)
             print("fullscreen-fit OFF", file=sys.stderr)
 
     def _process_cursor(self, cx: int, cy: int):
@@ -1846,6 +2154,10 @@ class Mirror:
     def _switch_to(self, connector: str):
         if self.verbose:
             print(f"switching {self.current_source or '(none)'} -> {connector}")
+        # Blackout is tied to a specific source — drop it on switch so
+        # we don't leave a black overlay on the old monitor.
+        if self._blackout_on:
+            self._set_blackout(False)
         self.pending_source = connector
         self._teardown()
         self.set_status(f"capturing {connector}…")
@@ -1883,7 +2195,7 @@ class Mirror:
             self.session_proxy = None
         self.current_source = None
 
-    def _start_capture(self, connector: str):
+    def _start_capture(self, connector: str, window_id: Optional[int] = None):
         # CreateSession({})
         res = self.sc_proxy.call_sync(
             "CreateSession",
@@ -1896,21 +2208,30 @@ class Mirror:
             SC_BUS, session_path, SESSION_IFACE, None,
         )
 
-        # RecordMonitor:
-        #   cursor-mode=1 (embedded — cursor baked into frame)
-        #   is-recording=true — tells Mutter we want continuous frames,
-        #     prevents direct-scanout from stalling our stream when a
-        #     fullscreen source app would otherwise bypass the
-        #     compositor's rendering path.
+        # cursor-mode=1 (embedded) keeps the system cursor in the
+        # frames so pointer/hand/I-beam/resize sprites render correctly.
+        # When window_id is given we use RecordWindow — captures only
+        # that window's surface tree, so we can layer black overlays
+        # on the monitor without the screencast picking them up
+        # (used by the blackout feature so the source goes dark for
+        # the user but the projector keeps streaming).
         props = {
             "cursor-mode": GLib.Variant("u", 1),
             "is-recording": GLib.Variant("b", True),
         }
-        res = self.session_proxy.call_sync(
-            "RecordMonitor",
-            GLib.Variant("(sa{sv})", (connector, props)),
-            Gio.DBusCallFlags.NONE, -1, None,
-        )
+        if window_id is not None:
+            props["window-id"] = GLib.Variant("t", int(window_id))
+            res = self.session_proxy.call_sync(
+                "RecordWindow",
+                GLib.Variant("(a{sv})", (props,)),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+        else:
+            res = self.session_proxy.call_sync(
+                "RecordMonitor",
+                GLib.Variant("(sa{sv})", (connector, props)),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
         stream_path = res.unpack()[0]
         self.stream_proxy = Gio.DBusProxy.new_sync(
             self.bus, Gio.DBusProxyFlags.NONE, None,
@@ -2019,6 +2340,22 @@ class Mirror:
         self.set_status("stream ended")
 
     def shutdown(self):
+        # Drop any blackout overlay we installed in shell.
+        try:
+            if self._blackout_on:
+                self._set_blackout(False)
+        except Exception:
+            pass
+        # Release the Alt+H grab so the hotkey returns to the system.
+        if self._blackout_action_id:
+            try:
+                _shell_proxy().call_sync(
+                    "UngrabAccelerator",
+                    GLib.Variant("(u)", (self._blackout_action_id,)),
+                    Gio.DBusCallFlags.NONE, -1, None,
+                )
+            except Exception:
+                pass
         self._teardown()
 
 
